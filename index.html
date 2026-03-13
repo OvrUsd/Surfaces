@@ -12,19 +12,33 @@
   
   <style>
     body, html { margin: 0; padding: 0; overflow: hidden; background-color: #f8fafc; }
-    /* Style pour le slider d'opacité */
     input[type=range] { accent-color: #4f46e5; }
+    .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+    .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+    .dark .custom-scrollbar::-webkit-scrollbar-thumb { background: #475569; }
+    .toast-enter { animation: toastIn 0.3s ease-out forwards; }
+    .toast-exit { animation: toastOut 0.3s ease-in forwards; }
+    @keyframes toastIn { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes toastOut { from { opacity: 1; transform: translateY(0); } to { opacity: 0; transform: translateY(16px); } }
   </style>
 </head>
 <body>
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useRef, useEffect, useMemo } = React;
+    const { useState, useRef, useEffect, useMemo, useCallback } = React;
 
-    const R = 6378137; 
+    /* ═══════════════════════════════════════════════
+       CONSTANTES & UTILITAIRES PURS (hors composant)
+       ═══════════════════════════════════════════════ */
+    const R = 6378137;
     const ORIGIN_SHIFT = 2 * Math.PI * R / 2.0;
     const INITIAL_RESOLUTION = 2 * Math.PI * R / 256.0;
+    const TILE_CACHE_MAX = 512;
+
+    let _idCounter = 0;
+    const uid = () => `id_${Date.now()}_${++_idCounter}`;
 
     const pxToGeo = (px, py, vp) => ({
       x: vp.center.x + (px - vp.width / 2) * vp.resolution,
@@ -34,111 +48,507 @@
       x: vp.width / 2 + (gx - vp.center.x) / vp.resolution,
       y: vp.height / 2 - (gy - vp.center.y) / vp.resolution
     });
-
     const getTileAtGeo = (gx, gy, z) => {
       const res = INITIAL_RESOLUTION / Math.pow(2, z);
-      const px = (gx + ORIGIN_SHIFT) / res;
-      const py = (ORIGIN_SHIFT - gy) / res;
-      return { tx: Math.floor(px / 256), ty: Math.floor(py / 256) };
+      return { tx: Math.floor((gx + ORIGIN_SHIFT) / res / 256), ty: Math.floor((ORIGIN_SHIFT - gy) / res / 256) };
     };
     const getGeoAtTile = (tx, ty, z) => {
       const res = INITIAL_RESOLUTION / Math.pow(2, z);
-      const px = tx * 256;
-      const py = ty * 256;
-      return { gx: px * res - ORIGIN_SHIFT, gy: ORIGIN_SHIFT - py * res };
+      return { gx: tx * 256 * res - ORIGIN_SHIFT, gy: ORIGIN_SHIFT - ty * 256 * res };
     };
-
     const hexToRgba = (hex, alpha) => {
-      const cleanHex = hex.replace('#', '');
-      const r = parseInt(cleanHex.substring(0, 2), 16);
-      const g = parseInt(cleanHex.substring(2, 4), 16);
-      const b = parseInt(cleanHex.substring(4, 6), 16);
-      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      const c = hex.replace('#', '');
+      return `rgba(${parseInt(c.substring(0,2),16)},${parseInt(c.substring(2,4),16)},${parseInt(c.substring(4,6),16)},${alpha})`;
+    };
+    const lonLatToMerc = (lon, lat) => ({
+      x: (lon * Math.PI / 180) * R,
+      y: Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) * R
+    });
+    const mercToLonLat = (mx, my) => ({
+      lon: (mx / R) * 180 / Math.PI,
+      lat: (2 * Math.atan(Math.exp(my / R)) - Math.PI / 2) * 180 / Math.PI
+    });
+
+    const formatAreaFn = (sqMeters, unit) => {
+      if (sqMeters === null || sqMeters === undefined) return '';
+      const opts = (d) => ({ maximumFractionDigits: d });
+      switch (unit) {
+        case 'mm²': return (sqMeters * 1e6).toLocaleString('fr-FR', opts(0)) + ' mm²';
+        case 'cm²': return (sqMeters * 1e4).toLocaleString('fr-FR', opts(1)) + ' cm²';
+        case 'm²': return sqMeters.toLocaleString('fr-FR', opts(2)) + ' m²';
+        case 'ha': return (sqMeters / 1e4).toLocaleString('fr-FR', opts(4)) + ' ha';
+        case 'km²': return (sqMeters / 1e6).toLocaleString('fr-FR', opts(4)) + ' km²';
+        default: return sqMeters.toLocaleString('fr-FR', opts(2)) + ' m²';
+      }
+    };
+    const formatDistanceFn = (meters) => {
+      if (meters < 1000) return `${meters.toLocaleString('fr-FR', { maximumFractionDigits: 2 })} m`;
+      return `${(meters / 1000).toLocaleString('fr-FR', { maximumFractionDigits: 2 })} km`;
     };
 
+    const PRESET_COLORS = [
+      { label: 'Rouge', hex: '#ef4444' }, { label: 'Rose', hex: '#ec4899' },
+      { label: 'Violet', hex: '#a855f7' }, { label: 'Bleu', hex: '#3b82f6' },
+      { label: 'Cyan', hex: '#06b6d4' }, { label: 'Vert', hex: '#22c55e' },
+      { label: 'Jaune', hex: '#eab308' }, { label: 'Orange', hex: '#f97316' },
+    ];
+
+    /* ═══ Composant Toast ═══ */
+    function Toast({ message, type, onDone }) {
+      const [exiting, setExiting] = useState(false);
+      useEffect(() => { const t = setTimeout(() => setExiting(true), 3000); return () => clearTimeout(t); }, []);
+      useEffect(() => { if (exiting) { const t = setTimeout(onDone, 300); return () => clearTimeout(t); } }, [exiting]);
+      const bg = type === 'error' ? 'bg-red-600' : type === 'success' ? 'bg-emerald-600' : 'bg-slate-800';
+      return (
+        <div className={`${exiting ? 'toast-exit' : 'toast-enter'} fixed bottom-6 left-1/2 -translate-x-1/2 z-[9999] px-5 py-3 rounded-xl text-white text-sm font-medium shadow-2xl pointer-events-none ${bg}`}>
+          {message}
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════
+       COMPOSANT PRINCIPAL
+       ═══════════════════════════════════════ */
     function App() {
-      const [viewport, setViewport] = useState({ center: { x: 0, y: 0 }, resolution: 0.5, width: 800, height: 600 });
-      const [mapMode, setMapMode] = useState('none'); 
-      const [renderTrigger, setRenderTrigger] = useState(0); 
+      /* ─── State React (UI réactive) ─── */
+      const [mapMode, setMapMode] = useState('none');
       const [darkMode, setDarkMode] = useState(false);
-      
       const [polygons, setPolygons] = useState([]);
-      const [lines, setLines] = useState([]); // Nouveau: pour l'outil règle
+      const [lines, setLines] = useState([]);
       const [currentPoints, setCurrentPoints] = useState([]);
-      const [mode, setMode] = useState('upload'); // 'auto-select', 'draw', 'measure', 'calibrate'
+      const [mode, setMode] = useState('upload');
       const [isLoading, setIsLoading] = useState(false);
-      const [baseMap, setBaseMap] = useState('ortho'); // 'ortho', 'plan', 'cadastre'
-      
-      const [isDragging, setIsDragging] = useState(false);
-      const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
-      const [dragMoved, setDragMoved] = useState(false);
-      
-      const containerRef = useRef(null);
-      const canvasRef = useRef(null);
-      const tileCache = useRef({}); 
-      
+      const [baseMap, setBaseMap] = useState('ortho');
+      const [activeParcelData, setActiveParcelData] = useState(null);
       const [addressQuery, setAddressQuery] = useState('');
       const [addressResults, setAddressResults] = useState([]);
       const [isSearching, setIsSearching] = useState(false);
       const [searchError, setSearchError] = useState('');
-      
       const [localImage, setLocalImage] = useState(null);
       const [calibrationPoints, setCalibrationPoints] = useState([]);
       const [knownDistance, setKnownDistance] = useState('');
       const [unitsPerMeter, setUnitsPerMeter] = useState(null);
       const [calibrationUnit, setCalibrationUnit] = useState('m');
       const [displayUnit, setDisplayUnit] = useState('m²');
-      
       const [activeColor, setActiveColor] = useState('#ef4444');
       const [parcelName, setParcelName] = useState('Parcelle A');
       const [editingPolygonId, setEditingPolygonId] = useState(null);
-      const [polygonOpacity, setPolygonOpacity] = useState(0.5); // Transparence ajustable
+      const [polygonOpacity, setPolygonOpacity] = useState(0.5);
+      const [toast, setToast] = useState(null);
+      const [isDraggingState, setIsDraggingState] = useState(false);
 
-      const formatArea = (sqMeters, unit) => {
-        if (sqMeters === null || sqMeters === undefined) return '';
-        switch (unit) {
-          case 'mm²': return (sqMeters * 1000000).toLocaleString('fr-FR', { maximumFractionDigits: 0 }) + ' mm²';
-          case 'cm²': return (sqMeters * 10000).toLocaleString('fr-FR', { maximumFractionDigits: 1 }) + ' cm²';
-          case 'm²': return sqMeters.toLocaleString('fr-FR', { maximumFractionDigits: 2 }) + ' m²';
-          case 'ha': return (sqMeters / 10000).toLocaleString('fr-FR', { maximumFractionDigits: 4 }) + ' ha';
-          case 'km²': return (sqMeters / 1000000).toLocaleString('fr-FR', { maximumFractionDigits: 4 }) + ' km²';
-          default: return sqMeters.toLocaleString('fr-FR', { maximumFractionDigits: 2 }) + ' m²';
+      /* ─── Viewport : ref impérative + state pour sync UI ─── */
+      const [viewportState, setViewportState] = useState({ center: { x: 0, y: 0 }, resolution: 0.5, width: 800, height: 600 });
+      const vpRef = useRef(viewportState);
+
+      const updateViewport = useCallback((updater) => {
+        const next = typeof updater === 'function' ? updater(vpRef.current) : updater;
+        vpRef.current = next;
+        scheduleRedraw();
+      }, []);
+
+      /* On synchronise le state React en batch à ~30fps pour l'UI (sidebar, etc.) */
+      const vpSyncRaf = useRef(null);
+      const scheduleVpSync = useCallback(() => {
+        if (!vpSyncRaf.current) {
+          vpSyncRaf.current = requestAnimationFrame(() => {
+            vpSyncRaf.current = null;
+            setViewportState({ ...vpRef.current });
+          });
+        }
+      }, []);
+
+      /* ─── Refs pour données lues par les handlers natifs (closures stables) ─── */
+      const containerRef = useRef(null);
+      const canvasRef = useRef(null);
+      const stateRef = useRef({});
+      // Synchronise stateRef à chaque render
+      stateRef.current = {
+        mapMode, mode, polygons, lines, currentPoints, calibrationPoints,
+        activeColor, parcelName, unitsPerMeter, darkMode, polygonOpacity,
+        baseMap, displayUnit, localImage
+      };
+
+      const mapModeRef = useRef(mapMode);
+      useEffect(() => { mapModeRef.current = mapMode; }, [mapMode]);
+      const modeRef = useRef(mode);
+      useEffect(() => { modeRef.current = mode; }, [mode]);
+
+      const tileCache = useRef({});
+      const tileCacheKeys = useRef([]);
+
+      const showToast = useCallback((message, type = 'info') => {
+        setToast({ message, type, key: uid() });
+      }, []);
+
+      /* ─── Canvas : boucle de rendu découplée ─── */
+      const needsRedraw = useRef(true);
+      const rafId = useRef(null);
+
+      const scheduleRedraw = useCallback(() => {
+        needsRedraw.current = true;
+      }, []);
+
+      // Force un redraw quand les données React changent
+      useEffect(() => { needsRedraw.current = true; }, [polygons, lines, currentPoints, activeColor, mode, displayUnit, mapMode, localImage, darkMode, polygonOpacity, baseMap, calibrationPoints]);
+
+      useEffect(() => {
+        let running = true;
+        const loop = () => {
+          if (!running) return;
+          if (needsRedraw.current) {
+            needsRedraw.current = false;
+            drawCanvas();
+          }
+          rafId.current = requestAnimationFrame(loop);
+        };
+        rafId.current = requestAnimationFrame(loop);
+        return () => { running = false; cancelAnimationFrame(rafId.current); };
+      }, []);
+
+      const drawCanvas = () => {
+        const canvas = canvasRef.current;
+        const vp = vpRef.current;
+        const s = stateRef.current;
+        if (!canvas || vp.width === 0 || s.mapMode === 'none') return;
+
+        const dpr = window.devicePixelRatio || 1;
+        if (canvas.width !== vp.width * dpr || canvas.height !== vp.height * dpr) {
+          canvas.width = vp.width * dpr;
+          canvas.height = vp.height * dpr;
+          canvas.style.width = `${vp.width}px`;
+          canvas.style.height = `${vp.height}px`;
+        }
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, vp.width, vp.height);
+
+        if (s.baseMap === 'cadastre') {
+          ctx.fillStyle = s.darkMode ? '#0f172a' : '#ffffff';
+          ctx.fillRect(0, 0, vp.width, vp.height);
+        }
+
+        // Tiles
+        if (s.mapMode === 'api') {
+          let z = Math.round(Math.log2(INITIAL_RESOLUTION / vp.resolution));
+          z = Math.max(0, Math.min(19, z));
+          const halfW = (vp.width / 2) * vp.resolution;
+          const halfH = (vp.height / 2) * vp.resolution;
+          const minTile = getTileAtGeo(vp.center.x - halfW, vp.center.y + halfH, z);
+          const maxTile = getTileAtGeo(vp.center.x + halfW, vp.center.y - halfH, z);
+
+          const layers = [];
+          if (s.baseMap === 'ortho') layers.push('ortho', 'cadastre');
+          else if (s.baseMap === 'plan') layers.push('plan', 'cadastre');
+          else if (s.baseMap === 'cadastre') layers.push('cadastre');
+
+          for (const layer of layers) {
+            for (let tx = minTile.tx; tx <= maxTile.tx; tx++) {
+              for (let ty = minTile.ty; ty <= maxTile.ty; ty++) {
+                const tile = getTile(layer, z, tx, ty);
+                const geoTL = getGeoAtTile(tx, ty, z);
+                const geoBR = getGeoAtTile(tx + 1, ty + 1, z);
+                const pTL = geoToPx(geoTL.gx, geoTL.gy, vp);
+                const pBR = geoToPx(geoBR.gx, geoBR.gy, vp);
+                const w = Math.ceil(pBR.x - pTL.x) + 1;
+                const h = Math.ceil(pBR.y - pTL.y) + 1;
+                if (tile.loaded) {
+                  ctx.drawImage(tile.img, Math.floor(pTL.x), Math.floor(pTL.y), w, h);
+                } else if (!tile.error && layer === 'ortho') {
+                  const pTx = Math.floor(tx / 2), pTy = Math.floor(ty / 2);
+                  const parent = tileCache.current[`${layer}_${z - 1}_${pTx}_${pTy}`];
+                  if (parent && parent.loaded) {
+                    ctx.drawImage(parent.img, (tx % 2) * 128, (ty % 2) * 128, 128, 128, Math.floor(pTL.x), Math.floor(pTL.y), w, h);
+                  } else {
+                    ctx.fillStyle = s.darkMode ? '#0f172a' : '#e2e8f0';
+                    ctx.fillRect(Math.floor(pTL.x), Math.floor(pTL.y), w, h);
+                  }
+                }
+              }
+            }
+          }
+        } else if (s.mapMode === 'local' && s.localImage) {
+          const tl = geoToPx(0, s.localImage.height, vp);
+          const br = geoToPx(s.localImage.width, 0, vp);
+          ctx.drawImage(s.localImage, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+        }
+
+        // Lines
+        for (const line of s.lines) {
+          ctx.strokeStyle = line.color;
+          ctx.lineWidth = 4;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          line.points.forEach((pt, i) => {
+            const p = geoToPx(pt.x, pt.y, vp);
+            i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y);
+          });
+          ctx.stroke();
+          const last = geoToPx(line.points[line.points.length - 1].x, line.points[line.points.length - 1].y, vp);
+          ctx.fillStyle = 'white'; ctx.font = 'bold 14px sans-serif';
+          ctx.strokeStyle = 'black'; ctx.lineWidth = 3;
+          ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+          const txt = formatDistanceFn(line.distance);
+          ctx.strokeText(txt, last.x + 10, last.y);
+          ctx.fillText(txt, last.x + 10, last.y);
+        }
+
+        // Polygons + labels
+        const drawnBoxes = [];
+        for (const poly of s.polygons) {
+          ctx.fillStyle = hexToRgba(poly.border, s.polygonOpacity);
+          ctx.strokeStyle = poly.border;
+          ctx.lineWidth = 3;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+          for (let i = 0; i < poly.points.length; i++) {
+            const p = geoToPx(poly.points[i].x, poly.points[i].y, vp);
+            i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y);
+            if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+            if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+          }
+          ctx.closePath(); ctx.fill(); ctx.stroke();
+
+          if (poly.points.length > 0) {
+            ctx.fillStyle = 'white'; ctx.font = '900 18px sans-serif';
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            const nameText = poly.name;
+            const areaText = (poly.area !== null && poly.area !== undefined) ? formatAreaFn(poly.area, s.displayUnit) : '';
+            const tw = Math.max(ctx.measureText(nameText).width, areaText ? ctx.measureText(areaText).width : 0) + 10;
+            const th = areaText ? 50 : 25;
+            const cx = minX + (maxX - minX) / 2, cy = minY + (maxY - minY) / 2;
+            let tx = cx, ty = cy, ok = false;
+            for (let att = 0; att < 50 && !ok; att++) {
+              const box = { left: tx - tw / 2, right: tx + tw / 2, top: ty - th / 2, bottom: ty + th / 2 };
+              if (!drawnBoxes.some(b => !(b.left > box.right + 4 || b.right < box.left - 4 || b.top > box.bottom + 4 || b.bottom < box.top - 4))) {
+                ok = true; drawnBoxes.push(box);
+              } else {
+                const a = att * Math.PI / 4, r = att * 4;
+                tx = cx + Math.cos(a) * r; ty = cy + Math.sin(a) * r;
+              }
+            }
+            ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 4;
+            const yo = areaText ? -12 : 0;
+            ctx.strokeText(nameText, tx, ty + yo); ctx.fillText(nameText, tx, ty + yo);
+            if (areaText) { ctx.strokeText(areaText, tx, ty + 14); ctx.fillText(areaText, tx, ty + 14); }
+          }
+        }
+
+        // Current drawing
+        if (s.currentPoints.length > 0 && (s.mode === 'draw' || s.mode === 'measure')) {
+          ctx.fillStyle = s.activeColor; ctx.strokeStyle = s.activeColor; ctx.lineWidth = 3;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          s.currentPoints.forEach((pt, i) => {
+            const p = geoToPx(pt.x, pt.y, vp);
+            i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y);
+            ctx.fillRect(p.x - 5, p.y - 5, 10, 10);
+          });
+          ctx.stroke();
+          if (s.mode === 'draw' && s.currentPoints.length > 2) {
+            const last = geoToPx(s.currentPoints[s.currentPoints.length - 1].x, s.currentPoints[s.currentPoints.length - 1].y, vp);
+            const first = geoToPx(s.currentPoints[0].x, s.currentPoints[0].y, vp);
+            ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(first.x, first.y);
+            ctx.setLineDash([5, 5]); ctx.stroke(); ctx.setLineDash([]);
+          }
         }
       };
 
-      const formatDistance = (meters) => {
-        if (meters < 1000) return `${meters.toLocaleString('fr-FR', { maximumFractionDigits: 2 })} m`;
-        return `${(meters/1000).toLocaleString('fr-FR', { maximumFractionDigits: 2 })} km`;
+      /* ─── Tile loader avec LRU ─── */
+      const getTile = (layer, z, x, y) => {
+        const key = `${layer}_${z}_${x}_${y}`;
+        if (tileCache.current[key]) {
+          const idx = tileCacheKeys.current.indexOf(key);
+          if (idx > -1) { tileCacheKeys.current.splice(idx, 1); tileCacheKeys.current.push(key); }
+          return tileCache.current[key];
+        }
+        let url = '';
+        if (layer === 'ortho') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
+        else if (layer === 'plan') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
+        else if (layer === 'cadastre') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=CADASTRALPARCELS.PARCELLAIRE_EXPRESS&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
+        const tile = { loaded: false, img: new Image() };
+        tileCache.current[key] = tile;
+        tileCacheKeys.current.push(key);
+        while (tileCacheKeys.current.length > TILE_CACHE_MAX) {
+          const old = tileCacheKeys.current.shift();
+          const oldTile = tileCache.current[old];
+          if (oldTile) { oldTile.img.src = ''; } // annule le chargement en cours
+          delete tileCache.current[old];
+        }
+        tile.img.crossOrigin = 'anonymous';
+        tile.img.onload = () => { tile.loaded = true; needsRedraw.current = true; };
+        tile.img.onerror = () => { tile.error = true; };
+        tile.img.src = url;
+        return tile;
       };
-      
-      const presetColors = [
-        { label: 'Rouge', hex: '#ef4444' }, { label: 'Rose', hex: '#ec4899' },
-        { label: 'Violet', hex: '#a855f7' }, { label: 'Bleu', hex: '#3b82f6' },
-        { label: 'Cyan', hex: '#06b6d4' }, { label: 'Vert', hex: '#22c55e' },
-        { label: 'Jaune', hex: '#eab308' }, { label: 'Orange', hex: '#f97316' },
-      ];
 
-      const areaSummaryByColor = useMemo(() => {
-        const summary = {};
-        polygons.forEach(poly => {
-          if (poly.area !== null && poly.area !== undefined) {
-            if (!summary[poly.border]) summary[poly.border] = 0;
-            summary[poly.border] += poly.area;
-          }
-        });
-        return summary;
-      }, [polygons]);
+      /* ═══════════════════════════════════════
+         INTERACTION : handlers natifs sur le container
+         (bindés 1 seule fois, lisent les refs)
+         ═══════════════════════════════════════ */
+      const dragRef = useRef({ active: false, moved: false, startX: 0, startY: 0 });
+      const lastTouchRef = useRef(null);
 
       useEffect(() => {
+        const el = containerRef.current;
+        if (!el) return;
+
+        /* ─ Wheel ─ */
+        const onWheel = (e) => {
+          if (mapModeRef.current === 'none') return;
+          e.preventDefault();
+          const vp = vpRef.current;
+          const factor = Math.exp(-e.deltaY * 0.002);
+          let newRes = vp.resolution / factor;
+          newRes = Math.max(0.05, Math.min(newRes, mapModeRef.current === 'api' ? 100 : 10));
+          const rect = el.getBoundingClientRect();
+          const mg = pxToGeo(e.clientX - rect.left, e.clientY - rect.top, vp);
+          updateViewport({
+            ...vp,
+            center: {
+              x: mg.x - (e.clientX - rect.left - vp.width / 2) * newRes,
+              y: mg.y + (e.clientY - rect.top - vp.height / 2) * newRes
+            },
+            resolution: newRes
+          });
+          scheduleVpSync();
+        };
+
+        /* ─ Mouse ─ */
+        const onMouseDown = (e) => {
+          if (mapModeRef.current === 'none') return;
+          // ignore si le clic est sur un élément UI flottant (panel, bouton, etc.)
+          if (e.target !== el && !e.target.matches('canvas')) return;
+          dragRef.current = { active: true, moved: false, startX: e.clientX, startY: e.clientY };
+          setIsDraggingState(true);
+        };
+        const onMouseMove = (e) => {
+          const d = dragRef.current;
+          if (!d.active) return;
+          const dx = e.clientX - d.startX, dy = e.clientY - d.startY;
+          if (Math.abs(dx) > 2 || Math.abs(dy) > 2) d.moved = true;
+          const vp = vpRef.current;
+          updateViewport({
+            ...vp,
+            center: { x: vp.center.x - dx * vp.resolution, y: vp.center.y + dy * vp.resolution }
+          });
+          d.startX = e.clientX; d.startY = e.clientY;
+          scheduleVpSync();
+        };
+        const onMouseUp = (e) => {
+          const d = dragRef.current;
+          if (!d.active) return;
+          d.active = false;
+          setIsDraggingState(false);
+          if (!d.moved && mapModeRef.current !== 'none') {
+            if (e.target !== el && !e.target.matches('canvas')) return;
+            const rect = el.getBoundingClientRect();
+            const geo = pxToGeo(e.clientX - rect.left, e.clientY - rect.top, vpRef.current);
+            handleMapClick(geo);
+          }
+        };
+
+        /* ─ Touch ─ */
+        const touchCenter = (ts) => {
+          let x = 0, y = 0;
+          for (let i = 0; i < ts.length; i++) { x += ts[i].clientX; y += ts[i].clientY; }
+          return { x: x / ts.length, y: y / ts.length };
+        };
+        const touchDist = (ts) => ts.length < 2 ? 0 : Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY);
+
+        const onTouchStart = (e) => {
+          if (mapModeRef.current === 'none') return;
+          lastTouchRef.current = { center: touchCenter(e.touches), dist: touchDist(e.touches) };
+          dragRef.current.moved = false;
+          setIsDraggingState(true);
+        };
+        const onTouchMove = (e) => {
+          const lt = lastTouchRef.current;
+          if (!lt || mapModeRef.current === 'none') return;
+          e.preventDefault();
+          const vp = vpRef.current;
+          const c = touchCenter(e.touches);
+          const dx = c.x - lt.center.x, dy = c.y - lt.center.y;
+          if (Math.abs(dx) > 1 || Math.abs(dy) > 1) dragRef.current.moved = true;
+          let newRes = vp.resolution;
+          if (e.touches.length >= 2 && lt.dist > 0) {
+            const f = touchDist(e.touches) / lt.dist;
+            newRes = Math.max(0.05, Math.min(vp.resolution / f, mapModeRef.current === 'api' ? 100 : 10));
+          }
+          updateViewport({
+            ...vp,
+            center: { x: vp.center.x - dx * vp.resolution, y: vp.center.y + dy * vp.resolution },
+            resolution: newRes
+          });
+          lastTouchRef.current = { center: c, dist: touchDist(e.touches) };
+          scheduleVpSync();
+        };
+        const onTouchEnd = (e) => {
+          if (e.touches.length === 0) {
+            lastTouchRef.current = null;
+            setIsDraggingState(false);
+            if (!dragRef.current.moved && mapModeRef.current !== 'none') {
+              // tap = clic sur le dernier point touch
+              const ct = e.changedTouches[0];
+              if (ct) {
+                const rect = el.getBoundingClientRect();
+                const geo = pxToGeo(ct.clientX - rect.left, ct.clientY - rect.top, vpRef.current);
+                handleMapClick(geo);
+              }
+            }
+          } else {
+            lastTouchRef.current = { center: touchCenter(e.touches), dist: touchDist(e.touches) };
+          }
+        };
+
+        el.addEventListener('wheel', onWheel, { passive: false });
+        el.addEventListener('mousedown', onMouseDown);
+        window.addEventListener('mousemove', onMouseMove);
+        window.addEventListener('mouseup', onMouseUp);
+        el.addEventListener('touchstart', onTouchStart, { passive: false });
+        el.addEventListener('touchmove', onTouchMove, { passive: false });
+        el.addEventListener('touchend', onTouchEnd, { passive: false });
+        return () => {
+          el.removeEventListener('wheel', onWheel);
+          el.removeEventListener('mousedown', onMouseDown);
+          window.removeEventListener('mousemove', onMouseMove);
+          window.removeEventListener('mouseup', onMouseUp);
+          el.removeEventListener('touchstart', onTouchStart);
+          el.removeEventListener('touchmove', onTouchMove);
+          el.removeEventListener('touchend', onTouchEnd);
+        };
+      }, []);
+
+      /* ─ Dispatch du clic carte ─ */
+      const handleMapClick = (geo) => {
+        const m = modeRef.current;
+        const mm = mapModeRef.current;
+        if (m === 'auto-select' && mm === 'api') {
+          const { lon, lat } = mercToLonLat(geo.x, geo.y);
+          fetchParcelFromClick(lon, lat);
+        } else if (m === 'calibrate') {
+          setCalibrationPoints(prev => prev.length < 2 ? [...prev, geo] : prev);
+        } else if (m === 'draw' || m === 'measure') {
+          setCurrentPoints(prev => [...prev, geo]);
+        }
+      };
+
+      /* ─── Resize ─── */
+      useEffect(() => {
         const observer = new ResizeObserver(entries => {
-          for (let entry of entries) {
-            setViewport(v => ({ ...v, width: entry.contentRect.width, height: entry.contentRect.height }));
+          for (const entry of entries) {
+            const w = entry.contentRect.width, h = entry.contentRect.height;
+            vpRef.current = { ...vpRef.current, width: w, height: h };
+            setViewportState(v => ({ ...v, width: w, height: h }));
+            needsRedraw.current = true;
           }
         });
         if (containerRef.current) observer.observe(containerRef.current);
         return () => observer.disconnect();
       }, []);
 
+      /* ─── Address search ─── */
       useEffect(() => {
         const query = addressQuery.trim();
         if (query.length < 3) { setAddressResults([]); setSearchError(''); return; }
@@ -149,11 +559,8 @@
             const res = await fetch(`https://api-adresse.data.gouv.fr/search/?q=${encodeURIComponent(query)}&limit=5`, { signal: controller.signal });
             if (!res.ok) throw new Error();
             const data = await res.json();
-            if (data && data.features && data.features.length > 0) {
-              setAddressResults(data.features); setSearchError('');
-            } else {
-              setAddressResults([]); setSearchError('Aucune adresse trouvée.');
-            }
+            if (data?.features?.length > 0) { setAddressResults(data.features); setSearchError(''); }
+            else { setAddressResults([]); setSearchError('Aucune adresse trouvée.'); }
           } catch (err) {
             if (err.name !== 'AbortError') setSearchError('Erreur de connexion avec le serveur.');
           } finally { setIsSearching(false); }
@@ -161,373 +568,235 @@
         return () => { clearTimeout(timer); controller.abort(); };
       }, [addressQuery]);
 
+      /* ─── Actions ─── */
       const loadMapFromAddress = (feature) => {
         setAddressResults([]);
         setAddressQuery(feature.properties.label);
-        const lon = feature.geometry.coordinates[0];
-        const lat = feature.geometry.coordinates[1];
-        const x = (lon * Math.PI / 180) * R;
-        const y = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) * R;
-        setViewport(v => ({ ...v, center: { x, y }, resolution: 0.5 })); 
+        const m = lonLatToMerc(feature.geometry.coordinates[0], feature.geometry.coordinates[1]);
+        const next = { ...vpRef.current, center: m, resolution: 0.5 };
+        vpRef.current = next;
+        setViewportState(next);
         setMapMode('api'); setMode('auto-select'); setParcelName('Parcelle A');
+        setActiveParcelData(null); needsRedraw.current = true;
       };
 
       const fetchParcelFromClick = async (lon, lat) => {
         setIsLoading(true);
         try {
-          const geomQuery = JSON.stringify({ type: "Point", coordinates: [lon, lat] });
-          const res = await fetch(`https://apicarto.ign.fr/api/cadastre/parcelle?geom=${geomQuery}`);
+          const geom = encodeURIComponent(JSON.stringify({ type: "Point", coordinates: [lon, lat] }));
+          const res = await fetch(`https://apicarto.ign.fr/api/cadastre/parcelle?geom=${geom}`);
           if (!res.ok) throw new Error();
           const data = await res.json();
-          if (data.features && data.features.length > 0) {
+          if (data.features?.length > 0) {
             const parcel = data.features[0];
             const num = parcel.properties.numero;
-            let rings = parcel.geometry.type === 'Polygon' ? [parcel.geometry.coordinates[0]] : parcel.geometry.coordinates.map(p => p[0]);
-            const geoPoints = rings[0].map(coord => ({
-              x: (coord[0] * Math.PI / 180) * R, y: Math.log(Math.tan(Math.PI / 4 + (coord[1] * Math.PI / 180) / 2)) * R
-            }));
-            setPolygons([...polygons, { 
-              id: Date.now(), name: `Parcelle ${num}`, points: geoPoints, border: activeColor, area: parcel.properties.contenance, isOfficial: true
-            }]);
-          }
-        } catch (err) { alert("Impossible de récupérer la géométrie de l'État."); }
-        setIsLoading(false);
-      };
+            const rings = parcel.geometry.type === 'Polygon' ? [parcel.geometry.coordinates[0]] : parcel.geometry.coordinates.map(p => p[0]);
+            const geoPoints = rings[0].map(c => lonLatToMerc(c[0], c[1]));
+            setPolygons(prev => [...prev, { id: uid(), name: `Parcelle ${num}`, points: geoPoints, border: stateRef.current.activeColor, area: parcel.properties.contenance, isOfficial: true }]);
+            setActiveParcelData({ num, isLoading: true });
 
-      // --- GPS (ME LOCALISER) ---
-      const handleGeolocate = () => {
-        if (!navigator.geolocation) return alert("Géolocalisation non supportée par votre navigateur.");
-        setIsLoading(true);
-        navigator.geolocation.getCurrentPosition(
-          (position) => {
-            const lon = position.coords.longitude;
-            const lat = position.coords.latitude;
-            const x = (lon * Math.PI / 180) * R;
-            const y = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) * R;
-            setViewport(v => ({ ...v, center: { x, y }, resolution: 0.5 })); 
-            setMapMode('api');
-            setMode('auto-select');
-            setIsLoading(false);
-          },
-          (error) => {
-            alert("Impossible de vous localiser. Vérifiez vos permissions.");
-            setIsLoading(false);
-          }
-        );
-      };
+            try {
+              const resGeo = await fetch(`https://api-adresse.data.gouv.fr/reverse/?lon=${lon}&lat=${lat}`);
+              const dataGeo = await resGeo.json();
+              let citycode = '', cityname = '';
+              if (dataGeo.features?.length > 0) {
+                citycode = dataGeo.features[0].properties.citycode;
+                cityname = dataGeo.features[0].properties.city;
+              }
+              let zoning = null;
+              try {
+                const gpuGeom = encodeURIComponent(JSON.stringify({ type: "Point", coordinates: [lon, lat] }));
+                const resGpu = await fetch(`https://apicarto.ign.fr/api/gpu/zone-urba?geom=${gpuGeom}`);
+                if (resGpu.ok) {
+                  const dataGpu = await resGpu.json();
+                  if (dataGpu.features?.length > 0) {
+                    const zp = dataGpu.features[0].properties;
+                    const types = { U: 'Urbaine', AU: 'À urbaniser', A: 'Agricole', N: 'Naturelle' };
+                    zoning = `Zone ${types[zp.typezone] || 'PLU'} ${zp.libelle ? '(' + zp.libelle + ')' : ''}`.trim();
+                  }
+                }
+              } catch (e) { console.error("Erreur PLU", e); }
 
-      const handleWheel = (e) => {
-        e.preventDefault();
-        if (mapMode === 'none') return;
-        const factor = Math.exp(-e.deltaY * 0.002);
-        let newRes = viewport.resolution / factor;
-        newRes = Math.max(0.05, Math.min(newRes, mapMode === 'api' ? 100 : 10));
-        const rect = containerRef.current.getBoundingClientRect();
-        const mouseGeo = pxToGeo(e.clientX - rect.left, e.clientY - rect.top, viewport);
-        const newCx = mouseGeo.x - (e.clientX - rect.left - viewport.width / 2) * newRes;
-        const newCy = mouseGeo.y + (e.clientY - rect.top - viewport.height / 2) * newRes;
-        setViewport(v => ({ ...v, center: { x: newCx, y: newCy }, resolution: newRes }));
-      };
-
-      useEffect(() => {
-        const container = containerRef.current;
-        if (container) {
-          container.addEventListener('wheel', handleWheel, { passive: false });
-          return () => container.removeEventListener('wheel', handleWheel);
-        }
-      }, [viewport, mapMode]);
-
-      const handleMouseDown = (e) => {
-        if (mapMode === 'none') return;
-        setIsDragging(true); setDragMoved(false); setDragStart({ x: e.clientX, y: e.clientY });
-      };
-
-      const handleMouseMove = (e) => {
-        if (!isDragging) return;
-        const dx = e.clientX - dragStart.x; const dy = e.clientY - dragStart.y;
-        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) setDragMoved(true);
-        setViewport(v => ({ ...v, center: { x: v.center.x - dx * v.resolution, y: v.center.y + dy * v.resolution } }));
-        setDragStart({ x: e.clientX, y: e.clientY });
-      };
-
-      const handleMouseUp = (e) => {
-        if (!isDragging) return;
-        setIsDragging(false);
-        if (!dragMoved && mapMode !== 'none') {
-          const rect = containerRef.current.getBoundingClientRect();
-          const geo = pxToGeo(e.clientX - rect.left, e.clientY - rect.top, viewport);
-          if (mode === 'auto-select' && mapMode === 'api') {
-            const lon = (geo.x / R) * 180 / Math.PI;
-            const lat = (2 * Math.atan(Math.exp(geo.y / R)) - Math.PI / 2) * 180 / Math.PI;
-            fetchParcelFromClick(lon, lat);
-          } 
-          else if (mode === 'calibrate' && calibrationPoints.length < 2) setCalibrationPoints([...calibrationPoints, geo]);
-          else if (mode === 'draw' || mode === 'measure') setCurrentPoints([...currentPoints, geo]);
-        }
-      };
-
-      const getTile = (layer, z, x, y) => {
-        const key = `${layer}_${z}_${x}_${y}`;
-        if (tileCache.current[key]) return tileCache.current[key];
-        let url = '';
-        if (layer === 'ortho') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
-        else if (layer === 'plan') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
-        else if (layer === 'cadastre') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=CADASTRALPARCELS.PARCELLAIRE_EXPRESS&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
-        
-        const tile = { loaded: false, img: new Image() };
-        tileCache.current[key] = tile;
-        tile.img.crossOrigin = "anonymous";
-        tile.img.onload = () => { tile.loaded = true; setRenderTrigger(prev => prev + 1); };
-        tile.img.onerror = () => { tile.error = true; };
-        tile.img.src = url;
-        return tile;
-      };
-
-      // Calcul de distance linéaire
-      const calculateDistance = (pts) => {
-        let dist = 0;
-        for(let i=1; i<pts.length; i++) {
-           const dx = pts[i].x - pts[i-1].x;
-           const dy = pts[i].y - pts[i-1].y;
-           dist += Math.sqrt(dx*dx + dy*dy);
-        }
-        if (mapMode === 'api') {
-           const centerLat = (2 * Math.atan(Math.exp(viewport.center.y / R)) - Math.PI / 2) * 180 / Math.PI;
-           dist *= Math.cos(centerLat * Math.PI / 180);
-        } else if (unitsPerMeter) {
-           dist /= unitsPerMeter;
-        }
-        return dist;
-      };
-
-      useEffect(() => {
-        const canvas = canvasRef.current;
-        if (!canvas || viewport.width === 0 || mapMode === 'none') return;
-        const dpr = window.devicePixelRatio || 1;
-        canvas.width = viewport.width * dpr; canvas.height = viewport.height * dpr;
-        canvas.style.width = `${viewport.width}px`; canvas.style.height = `${viewport.height}px`;
-        const ctx = canvas.getContext('2d');
-        ctx.scale(dpr, dpr);
-        ctx.clearRect(0, 0, viewport.width, viewport.height);
-
-        // Fond blanc pur pour le mode plan / cadastre
-        if (baseMap === 'cadastre') {
-          ctx.fillStyle = '#ffffff';
-          ctx.fillRect(0,0, viewport.width, viewport.height);
-        }
-
-        if (mapMode === 'api') {
-          let z = Math.round(Math.log2(INITIAL_RESOLUTION / viewport.resolution));
-          z = Math.max(0, Math.min(19, z));
-          const vpMinX = viewport.center.x - (viewport.width / 2) * viewport.resolution;
-          const vpMaxX = viewport.center.x + (viewport.width / 2) * viewport.resolution;
-          const vpMinY = viewport.center.y - (viewport.height / 2) * viewport.resolution;
-          const vpMaxY = viewport.center.y + (viewport.height / 2) * viewport.resolution;
-          const minTile = getTileAtGeo(vpMinX, vpMaxY, z);
-          const maxTile = getTileAtGeo(vpMaxX, vpMinY, z);
-
-          // Gestion dynamique des couches
-          const layers = [];
-          if (baseMap === 'ortho') layers.push('ortho', 'cadastre');
-          else if (baseMap === 'plan') layers.push('plan', 'cadastre');
-          else if (baseMap === 'cadastre') layers.push('cadastre');
-
-          layers.forEach(layer => {
-            for (let tx = minTile.tx; tx <= maxTile.tx; tx++) {
-              for (let ty = minTile.ty; ty <= maxTile.ty; ty++) {
-                const tile = getTile(layer, z, tx, ty);
-                const geoTL = getGeoAtTile(tx, ty, z);
-                const geoBR = getGeoAtTile(tx + 1, ty + 1, z);
-                const pxTL = geoToPx(geoTL.gx, geoTL.gy, viewport);
-                const pxBR = geoToPx(geoBR.gx, geoBR.gy, viewport);
-                const w = Math.ceil(pxBR.x - pxTL.x) + 1; const h = Math.ceil(pxBR.y - pxTL.y) + 1;
-
-                if (tile.loaded) {
-                  ctx.drawImage(tile.img, Math.floor(pxTL.x), Math.floor(pxTL.y), w, h);
-                } else if (!tile.error && layer === 'ortho') {
-                  const pTx = Math.floor(tx / 2); const pTy = Math.floor(ty / 2);
-                  const parentTile = tileCache.current[`${layer}_${z-1}_${pTx}_${pTy}`];
-                  if (parentTile && parentTile.loaded) {
-                    const sX = (tx % 2) * 128; const sY = (ty % 2) * 128;
-                    ctx.drawImage(parentTile.img, sX, sY, 128, 128, Math.floor(pxTL.x), Math.floor(pxTL.y), w, h);
-                  } else {
-                    ctx.fillStyle = darkMode ? '#0f172a' : '#e2e8f0';
-                    ctx.fillRect(Math.floor(pxTL.x), Math.floor(pxTL.y), w, h);
+              let risks = [];
+              if (citycode) {
+                const resRisk = await fetch(`https://georisques.gouv.fr/api/v1/gaspar/risques?code_insee=${citycode}`);
+                if (resRisk.ok) {
+                  const dr = await resRisk.json();
+                  if (dr.data) {
+                    dr.data.forEach(item => {
+                      if (item.libelle_risque_long) risks.push(item.libelle_risque_long);
+                      if (Array.isArray(item.risques_detail)) item.risques_detail.forEach(d => { if (d.libelle_risque_long) risks.push(d.libelle_risque_long); });
+                    });
+                    risks = [...new Set(risks)].filter(Boolean);
                   }
                 }
               }
+              const reportUrl = `https://georisques.gouv.fr/cartes/interactives?lat=${lat}&lng=${lon}&zoom=18`;
+              setActiveParcelData({ num, area: parcel.properties.contenance, city: cityname, citycode, lon, lat, risks: risks.map(n => ({ name: n, scope: 'Commune', url: reportUrl })), zoning, isLoading: false, reportUrl });
+            } catch (e) {
+              console.error(e);
+              setActiveParcelData({ num, city: 'Inconnue', risks: [], isLoading: false, error: true });
             }
-          });
-        } else if (mapMode === 'local' && localImage) {
-          const tl = geoToPx(0, localImage.height, viewport);
-          const br = geoToPx(localImage.width, 0, viewport);
-          ctx.drawImage(localImage, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
-        }
-
-        // Lignes (Outil Règle)
-        lines.forEach(line => {
-           ctx.strokeStyle = line.color;
-           ctx.lineWidth = 4;
-           ctx.beginPath();
-           line.points.forEach((pt, idx) => {
-             const px = geoToPx(pt.x, pt.y, viewport);
-             if(idx===0) ctx.moveTo(px.x, px.y); else ctx.lineTo(px.x, px.y);
-           });
-           ctx.stroke();
-           
-           // Affiche la distance au dernier point
-           const lastPt = geoToPx(line.points[line.points.length-1].x, line.points[line.points.length-1].y, viewport);
-           ctx.fillStyle = 'white'; ctx.font = 'bold 14px sans-serif';
-           ctx.strokeStyle = 'black'; ctx.lineWidth = 3;
-           const text = formatDistance(line.distance);
-           ctx.strokeText(text, lastPt.x + 10, lastPt.y);
-           ctx.fillText(text, lastPt.x + 10, lastPt.y);
-        });
-
-        const drawnLabelsBoxes = [];
-        const checkCollision = (box1, box2) => {
-          const margin = 4;
-          return !(box2.left > box1.right + margin || box2.right < box1.left - margin || box2.top > box1.bottom + margin || box2.bottom < box1.top - margin);
-        };
-
-        polygons.forEach((poly) => {
-          ctx.fillStyle = hexToRgba(poly.border, polygonOpacity);
-          ctx.strokeStyle = poly.border;
-          ctx.lineWidth = 3;
-          ctx.beginPath();
-          poly.points.forEach((pt, index) => {
-            const pxPt = geoToPx(pt.x, pt.y, viewport);
-            if (index === 0) ctx.moveTo(pxPt.x, pxPt.y); else ctx.lineTo(pxPt.x, pxPt.y);
-          });
-          ctx.closePath(); ctx.fill(); ctx.stroke();
-          
-          if (poly.points.length > 0) {
-            const pxPoints = poly.points.map(pt => geoToPx(pt.x, pt.y, viewport));
-            const minX = Math.min(...pxPoints.map(p => p.x)); const maxX = Math.max(...pxPoints.map(p => p.x));
-            const minY = Math.min(...pxPoints.map(p => p.y)); const maxY = Math.max(...pxPoints.map(p => p.y));
-            let targetX = minX + (maxX - minX) / 2; let targetY = minY + (maxY - minY) / 2;
-
-            ctx.fillStyle = 'white'; ctx.font = '900 18px sans-serif';
-            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-            const nameText = poly.name;
-            const areaText = poly.area !== null && poly.area !== undefined ? `${formatArea(poly.area, displayUnit)}` : '';
-            const nameMetrics = ctx.measureText(nameText);
-            const areaMetrics = areaText ? ctx.measureText(areaText) : { width: 0 };
-            const textWidth = Math.max(nameMetrics.width, areaMetrics.width) + 10;
-            const textHeight = areaText ? 50 : 25; 
-
-            let collision = true; let attempt = 0; let angle = 0; let radius = 0;
-            while (collision && attempt < 50) {
-                const currentBox = { left: targetX - textWidth/2, right: targetX + textWidth/2, top: targetY - textHeight/2, bottom: targetY + textHeight/2 };
-                collision = drawnLabelsBoxes.some(drawnBox => checkCollision(currentBox, drawnBox));
-                if (collision) {
-                    attempt++; angle += Math.PI / 4; radius += 4; 
-                    targetX = (minX + (maxX - minX) / 2) + Math.cos(angle) * radius;
-                    targetY = (minY + (maxY - minY) / 2) + Math.sin(angle) * radius;
-                } else { drawnLabelsBoxes.push(currentBox); }
-            }
-
-            ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 4;
-            const yOffsetName = areaText ? -12 : 0;
-            ctx.strokeText(nameText, targetX, targetY + yOffsetName); ctx.fillText(nameText, targetX, targetY + yOffsetName);
-            if (areaText) { ctx.strokeText(areaText, targetX, targetY + 14); ctx.fillText(areaText, targetX, targetY + 14); }
           }
-        });
+        } catch (err) { showToast("Impossible de récupérer la géométrie de la parcelle.", 'error'); }
+        setIsLoading(false);
+      };
 
-        // Dessin en cours
-        if (currentPoints.length > 0 && (mode === 'draw' || mode === 'measure')) {
-          ctx.fillStyle = activeColor; ctx.strokeStyle = activeColor; ctx.lineWidth = 3;
-          ctx.beginPath();
-          currentPoints.forEach((pt, index) => {
-            const pxPt = geoToPx(pt.x, pt.y, viewport);
-            if (index === 0) ctx.moveTo(pxPt.x, pxPt.y); else ctx.lineTo(pxPt.x, pxPt.y);
-            ctx.fillRect(pxPt.x - 5, pxPt.y - 5, 10, 10);
-          });
-          ctx.stroke();
-          
-          if (mode === 'draw' && currentPoints.length > 2) {
-            ctx.beginPath();
-            const lastPt = geoToPx(currentPoints[currentPoints.length - 1].x, currentPoints[currentPoints.length - 1].y, viewport);
-            const firstPt = geoToPx(currentPoints[0].x, currentPoints[0].y, viewport);
-            ctx.moveTo(lastPt.x, lastPt.y); ctx.lineTo(firstPt.x, firstPt.y);
-            ctx.setLineDash([5, 5]); ctx.stroke(); ctx.setLineDash([]);
-          }
-        }
+      const handleGeolocate = () => {
+        if (!navigator.geolocation) return showToast("Géolocalisation non supportée.", 'error');
+        setIsLoading(true);
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            const m = lonLatToMerc(pos.coords.longitude, pos.coords.latitude);
+            const next = { ...vpRef.current, center: m, resolution: 0.5 };
+            vpRef.current = next; setViewportState(next);
+            setMapMode('api'); setMode('auto-select'); setActiveParcelData(null);
+            setIsLoading(false); needsRedraw.current = true;
+          },
+          () => { showToast("Impossible de vous localiser.", 'error'); setIsLoading(false); }
+        );
+      };
 
-      }, [viewport, renderTrigger, polygons, lines, currentPoints, activeColor, calibrationPoints, mode, displayUnit, mapMode, localImage, darkMode, polygonOpacity, baseMap]);
+      const calculateDistance = (pts) => {
+        let dist = 0;
+        for (let i = 1; i < pts.length; i++) dist += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+        if (mapMode === 'api') {
+          const { lat } = mercToLonLat(vpRef.current.center.x, vpRef.current.center.y);
+          dist *= Math.cos(lat * Math.PI / 180);
+        } else if (unitsPerMeter) dist /= unitsPerMeter;
+        return dist;
+      };
 
       const handleImageUpload = (e) => {
         const file = e.target.files[0];
-        if (file) {
-          const reader = new FileReader();
-          reader.onload = (event) => {
-            const img = new Image();
-            img.onload = () => {
-              setLocalImage(img); setMapMode('local');
-              setViewport(v => ({ ...v, center: { x: img.width / 2, y: img.height / 2 }, resolution: Math.max(img.width / v.width, img.height / v.height) * 1.05 }));
-              setPolygons([]); setLines([]); setCurrentPoints([]); setCalibrationPoints([]); setUnitsPerMeter(null);
-              setMode('calibrate'); setParcelName('Surface A');
-            };
-            img.src = event.target.result;
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const img = new Image();
+          img.onload = () => {
+            setLocalImage(img); setMapMode('local');
+            const next = { ...vpRef.current, center: { x: img.width / 2, y: img.height / 2 }, resolution: Math.max(img.width / vpRef.current.width, img.height / vpRef.current.height) * 1.05 };
+            vpRef.current = next; setViewportState(next);
+            setPolygons([]); setLines([]); setCurrentPoints([]); setCalibrationPoints([]); setUnitsPerMeter(null);
+            setMode('calibrate'); setParcelName('Surface A'); setActiveParcelData(null);
+            needsRedraw.current = true;
           };
-          reader.readAsDataURL(file);
+          img.src = ev.target.result;
+        };
+        reader.readAsDataURL(file);
+      };
+
+      const applyCalibration = () => {
+        if (calibrationPoints.length === 2 && knownDistance > 0) {
+          const dx = calibrationPoints[1].x - calibrationPoints[0].x, dy = calibrationPoints[1].y - calibrationPoints[0].y;
+          const distUnits = Math.hypot(dx, dy);
+          const mult = calibrationUnit === 'mm' ? 0.001 : calibrationUnit === 'cm' ? 0.01 : calibrationUnit === 'km' ? 1000 : 1;
+          const distMeters = parseFloat(knownDistance) * mult;
+          const newUPM = distUnits / distMeters;
+          setUnitsPerMeter(newUPM); setMode('draw');
+          setPolygons(prev => prev.map(poly => {
+            if (poly.isOfficial) return poly;
+            let a = 0;
+            for (let i = 0; i < poly.points.length; i++) {
+              const j = (i + 1) % poly.points.length;
+              a += poly.points[i].x * poly.points[j].y - poly.points[j].x * poly.points[i].y;
+            }
+            return { ...poly, area: Math.abs(a) / 2 / (newUPM * newUPM) };
+          }));
         }
       };
 
       const completePolygon = () => {
         if (mode === 'measure' && currentPoints.length >= 2) {
-           const dist = calculateDistance(currentPoints);
-           setLines([...lines, { id: Date.now(), points: currentPoints, color: activeColor, distance: dist }]);
-           setCurrentPoints([]);
-        } 
-        else if (mode === 'draw' && currentPoints.length >= 3) {
-          let area = 0; let realArea = null;
+          setLines(prev => [...prev, { id: uid(), points: currentPoints, color: activeColor, distance: calculateDistance(currentPoints) }]);
+          setCurrentPoints([]);
+        } else if (mode === 'draw' && currentPoints.length >= 3) {
+          let a = 0;
           for (let i = 0; i < currentPoints.length; i++) {
             const j = (i + 1) % currentPoints.length;
-            area += currentPoints[i].x * currentPoints[j].y;
-            area -= currentPoints[j].x * currentPoints[i].y;
+            a += currentPoints[i].x * currentPoints[j].y - currentPoints[j].x * currentPoints[i].y;
           }
-          area = Math.abs(area) / 2;
-
+          a = Math.abs(a) / 2;
+          let realArea = null;
           if (mapMode === 'api') {
-            const centerLat = (2 * Math.atan(Math.exp(viewport.center.y / R)) - Math.PI / 2) * 180 / Math.PI;
-            realArea = area * Math.cos(centerLat * Math.PI / 180) * Math.cos(centerLat * Math.PI / 180);
-          } else if (unitsPerMeter) realArea = area / (unitsPerMeter * unitsPerMeter);
-          
-          setPolygons([...polygons, { id: Date.now(), name: parcelName, points: currentPoints, border: activeColor, area: realArea, isOfficial: false }]);
+            const { lat } = mercToLonLat(vpRef.current.center.x, vpRef.current.center.y);
+            const cosLat = Math.cos(lat * Math.PI / 180);
+            realArea = a * cosLat * cosLat;
+          } else if (unitsPerMeter) realArea = a / (unitsPerMeter * unitsPerMeter);
+          setPolygons(prev => [...prev, { id: uid(), name: parcelName, points: currentPoints, border: activeColor, area: realArea, isOfficial: false }]);
           setCurrentPoints([]);
           setParcelName(`${mapMode === 'api' ? 'Parcelle' : 'Surface'} ${String.fromCharCode(65 + polygons.length + 1)}`);
         }
       };
 
-      // --- EXPORT / IMPORT PROJET ---
+      const deletePolygon = (id) => setPolygons(prev => prev.filter(p => p.id !== id));
+      const deleteLine = (id) => setLines(prev => prev.filter(l => l.id !== id));
+      const handleRenameSubmit = (id, newName) => {
+        setPolygons(prev => prev.map(p => p.id === id ? { ...p, name: newName.trim() || p.name } : p));
+        setEditingPolygonId(null);
+      };
+
+      const resetImage = () => {
+        setMapMode('none'); setLocalImage(null); setPolygons([]); setLines([]);
+        setAddressQuery(''); setAddressResults([]); setSearchError('');
+        setParcelName('Parcelle A'); setActiveParcelData(null);
+        tileCache.current = {}; tileCacheKeys.current = [];
+      };
+
       const exportProject = () => {
-        const data = { polygons, lines, viewport, mapMode, baseMap, addressQuery, parcelName };
-        const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+        const data = { polygons, lines, viewport: vpRef.current, mapMode, baseMap, addressQuery, parcelName };
+        const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url; a.download = 'surfaces_io_projet.json'; a.click();
+        URL.revokeObjectURL(url);
       };
 
       const importProject = (e) => {
         const file = e.target.files[0];
         if (!file) return;
         const reader = new FileReader();
-        reader.onload = (event) => {
+        reader.onload = (ev) => {
           try {
-            const data = JSON.parse(event.target.result);
+            const data = JSON.parse(ev.target.result);
             if (data.polygons) setPolygons(data.polygons);
             if (data.lines) setLines(data.lines);
-            if (data.viewport) setViewport(data.viewport);
+            if (data.viewport) { vpRef.current = data.viewport; setViewportState(data.viewport); }
             if (data.mapMode) setMapMode(data.mapMode);
             if (data.baseMap) setBaseMap(data.baseMap);
             if (data.addressQuery) setAddressQuery(data.addressQuery);
             if (data.parcelName) setParcelName(data.parcelName);
-            setMode('upload'); // Reset mode
-          } catch(err) { alert("Fichier de sauvegarde invalide ou corrompu."); }
+            setMode('upload'); setActiveParcelData(null); needsRedraw.current = true;
+          } catch (err) { showToast("Fichier invalide ou corrompu.", 'error'); }
         };
         reader.readAsText(file);
+        e.target.value = ''; // permet de réimporter le même fichier
       };
+
+      const downloadImage = () => {
+        if (!canvasRef.current) return;
+        const link = document.createElement('a');
+        link.download = 'surfaces-io-export.png';
+        link.href = canvasRef.current.toDataURL('image/png');
+        link.click();
+      };
+
+      const downloadPDF = () => {
+        if (!canvasRef.current) return;
+        const dataUrl = canvasRef.current.toDataURL('image/png');
+        const pw = window.open('', '_blank');
+        if (pw) {
+          pw.document.write(`<!DOCTYPE html><html><head><title>surfaces.io - Export PDF</title><style>@page{size:landscape;margin:0}body{margin:0;display:flex;justify-content:center;align-items:center;height:100vh;background:#fff}img{max-width:100%;max-height:100vh;object-fit:contain}</style></head><body><img src="${dataUrl}" onload="setTimeout(()=>{window.print();window.close()},200)"/></body></html>`);
+          pw.document.close();
+        } else showToast("Veuillez autoriser les pop-ups.", 'error');
+      };
+
+      /* ─── Computed ─── */
+      const areaSummaryByColor = useMemo(() => {
+        const s = {};
+        polygons.forEach(p => { if (p.area != null) { s[p.border] = (s[p.border] || 0) + p.area; } });
+        return s;
+      }, [polygons]);
 
       const theme = {
         app: darkMode ? "bg-slate-900 text-slate-200" : "bg-slate-50 text-slate-800",
@@ -541,13 +810,18 @@
         border: darkMode ? "border-slate-700" : "border-slate-200",
         borderLight: darkMode ? "border-slate-700/50" : "border-slate-100",
         hoverBtn: darkMode ? "hover:bg-slate-700 text-slate-300" : "hover:bg-slate-50 text-slate-700",
-        buttonSecondary: darkMode ? "bg-slate-800 border-slate-600 text-slate-200 hover:bg-slate-700" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+        buttonSecondary: darkMode ? "bg-slate-800 border-slate-600 text-slate-200 hover:bg-slate-700" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50",
+        canvasBg: darkMode ? "bg-slate-950" : "bg-slate-100",
       };
 
+      /* ═══════════════════════════════════════
+         RENDU JSX
+         ═══════════════════════════════════════ */
       return (
         <div className={`flex h-screen font-sans overflow-hidden select-none transition-colors duration-200 ${theme.app}`}>
-          
-          {/* Sidebar */}
+          {toast && <Toast key={toast.key} message={toast.message} type={toast.type} onDone={() => setToast(null)} />}
+
+          {/* ═══ SIDEBAR ═══ */}
           <div className={`w-80 border-r flex flex-col z-20 transition-colors duration-200 ${theme.sidebar} shadow-sm`}>
             <div className={`h-16 flex items-center justify-between px-6 border-b flex-shrink-0 ${theme.borderLight}`}>
               <div className="flex items-center gap-2">
@@ -556,23 +830,27 @@
                 </div>
                 <span className={`text-xl font-bold tracking-tight ${theme.textTitle}`}>surfaces<span className="text-indigo-500">.io</span></span>
               </div>
-              <button onClick={() => setDarkMode(!darkMode)} className={`p-2 rounded-full transition-colors ${theme.hoverBtn}`}>
-                {darkMode ? <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg> : <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>}
+              <button onClick={() => setDarkMode(!darkMode)} className={`p-2 rounded-full transition-colors ${theme.hoverBtn}`} title={darkMode ? "Mode clair" : "Mode sombre"}>
+                {darkMode ? (
+                  <svg className="w-5 h-5 text-amber-300" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+                ) : (
+                  <svg className="w-5 h-5 text-indigo-600" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+                )}
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6 space-y-8">
-              
-              {/* 1. Localisation */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-8 custom-scrollbar">
+              {/* ── 1. Source ── */}
               <section>
                 <h2 className={`text-xs font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>1. Source du plan</h2>
                 {mapMode === 'none' ? (
                   <div className="space-y-4">
                     <div className="relative">
-                      <svg className={`w-5 h-5 absolute left-3 top-2.5 ${theme.textMuted}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
-                      <input type="text" placeholder="Ex: Nîmes" value={addressQuery} onChange={(e) => setAddressQuery(e.target.value)} className={`w-full pl-10 pr-10 py-2 text-sm border rounded-lg outline-none transition-colors shadow-sm ${theme.input}`} />
-                      {isSearching && <div className="absolute right-3 top-2.5"><div className="w-4 h-4 border-2 border-transparent border-t-indigo-500 rounded-full animate-spin"></div></div>}
+                      <svg className={`w-5 h-5 absolute left-3 top-2.5 ${theme.textMuted}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+                      <input type="text" placeholder="Ex: Nîmes" value={addressQuery} onChange={e => setAddressQuery(e.target.value)} className={`w-full pl-10 pr-10 py-2 text-sm border rounded-lg outline-none transition-colors shadow-sm ${theme.input}`} />
+                      {isSearching && <div className="absolute right-3 top-2.5"><div className="w-4 h-4 border-2 border-transparent border-t-indigo-500 rounded-full animate-spin"/></div>}
                     </div>
+                    {searchError && <p className={`text-xs ${theme.textMuted}`}>{searchError}</p>}
                     {addressResults.length > 0 && (
                       <div className={`border rounded-lg overflow-hidden flex flex-col ${theme.panel}`}>
                         {addressResults.map((feat, idx) => {
@@ -588,7 +866,7 @@
                       </div>
                     )}
                     <div className="flex items-center gap-2 pt-2">
-                      <div className={`flex-1 h-px ${theme.border}`}></div><span className={`text-xs font-bold uppercase tracking-wider ${theme.textMuted}`}>ou</span><div className={`flex-1 h-px ${theme.border}`}></div>
+                      <div className={`flex-1 h-px ${theme.border}`}/><span className={`text-xs font-bold uppercase tracking-wider ${theme.textMuted}`}>ou</span><div className={`flex-1 h-px ${theme.border}`}/>
                     </div>
                     <label className={`flex flex-col items-center justify-center w-full h-16 border-2 border-dashed rounded-xl cursor-pointer group transition-colors ${darkMode ? 'bg-slate-800/50 border-slate-600 hover:bg-slate-700 text-slate-300' : 'bg-slate-50 border-slate-300 hover:bg-slate-100 text-slate-600'}`}>
                       <span className={`text-xs font-medium transition-colors ${darkMode ? 'group-hover:text-indigo-400' : 'group-hover:text-indigo-600'}`}>Importer une image locale</span>
@@ -597,28 +875,26 @@
                   </div>
                 ) : (
                   <div className={`flex items-center justify-between p-3 border rounded-lg ${theme.panel}`}>
-                    <div className="flex flex-col">
-                      <span className={`text-sm font-medium flex items-center gap-2 ${theme.textTitle}`}><svg className="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>Plan chargé</span>
-                    </div>
-                    <button onClick={() => { setMapMode('none'); setAddressResults([]); setAddressQuery(''); }} className="text-xs text-red-500 hover:text-red-600 font-medium">Changer</button>
+                    <span className={`text-sm font-medium flex items-center gap-2 ${theme.textTitle}`}>
+                      <svg className="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"/></svg>Plan chargé
+                    </span>
+                    <button onClick={resetImage} className="text-xs text-red-500 hover:text-red-600 font-medium">Changer</button>
                   </div>
                 )}
               </section>
 
-              {/* 2. Outils */}
+              {/* ── 2. Outils ── */}
               {mapMode !== 'none' && (
                 <section>
                   <h2 className={`text-xs font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>2. Outils de dessin</h2>
                   <div className={`border rounded-xl p-4 space-y-4 ${theme.panel}`}>
-                    
-                    {/* Palette */}
                     <div>
                       <label className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted} mb-3 block`}>Couleur et Transparence</label>
                       <div className="flex items-center gap-3 mb-3">
                         <div className="flex flex-wrap gap-2.5 flex-1">
-                          {presetColors.map((c) => (
+                          {PRESET_COLORS.map(c => (
                             <button key={c.hex} onClick={() => setActiveColor(c.hex)} className={`w-7 h-7 rounded-full shadow-sm transition-all flex items-center justify-center hover:scale-110 ${activeColor === c.hex ? `ring-2 ring-offset-2 ${darkMode ? 'ring-offset-slate-800 ring-indigo-400' : 'ring-offset-white ring-indigo-500'} z-10` : 'opacity-80 hover:opacity-100'}`} style={{ backgroundColor: c.hex }}>
-                              {activeColor === c.hex && <div className="w-2.5 h-2.5 bg-white rounded-full shadow-sm"></div>}
+                              {activeColor === c.hex && <div className="w-2.5 h-2.5 bg-white rounded-full shadow-sm"/>}
                             </button>
                           ))}
                         </div>
@@ -628,32 +904,58 @@
 
                     <hr className={theme.border} />
 
-                    {/* Modes de dessin */}
+                    {mapMode === 'local' && (
+                      <div className="space-y-3 mb-4">
+                        {!unitsPerMeter ? (
+                          <div className={`p-3 rounded-lg border space-y-2 ${darkMode ? 'bg-amber-900/20 border-amber-700/50' : 'bg-amber-50 border-amber-200'}`}>
+                            <span className={`text-xs font-bold uppercase ${darkMode ? 'text-amber-500' : 'text-amber-800'}`}>Étalonnage requis</span>
+                            <p className={`text-xs ${darkMode ? 'text-amber-400/80' : 'text-amber-700'}`}>Tracez une ligne connue pour le calcul des surfaces.</p>
+                            {mode !== 'calibrate' ? (
+                              <button onClick={() => { setMode('calibrate'); setCalibrationPoints([]); }} className={`w-full py-2 rounded-md text-xs font-medium border transition-colors ${darkMode ? 'bg-slate-800 border-amber-700/50 text-amber-400 hover:bg-amber-900/30' : 'bg-white border-amber-300 text-amber-700 hover:bg-amber-100'}`}>Définir l'échelle</button>
+                            ) : (
+                              <div className="mt-2 space-y-2">
+                                {calibrationPoints.length < 2 ? (
+                                  <div className={`text-xs font-medium animate-pulse p-2 rounded text-center ${darkMode ? 'bg-amber-900/40 text-amber-400' : 'bg-amber-100 text-amber-600'}`}>
+                                    {calibrationPoints.length === 0 ? "1. Cliquez sur le premier point" : "2. Cliquez sur le second point"}
+                                  </div>
+                                ) : (
+                                  <div className={`space-y-2 p-2 rounded border ${darkMode ? 'bg-slate-800 border-amber-700/50' : 'bg-white border-amber-200'}`}>
+                                    <label className={`text-[10px] font-bold uppercase ${theme.textMuted}`}>Distance réelle</label>
+                                    <div className="flex gap-2">
+                                      <input type="number" value={knownDistance} onChange={e => setKnownDistance(e.target.value)} placeholder="Ex: 10" className={`w-full p-1.5 text-sm border rounded outline-none transition-colors ${theme.input}`} />
+                                      <select value={calibrationUnit} onChange={e => setCalibrationUnit(e.target.value)} className={`p-1.5 text-sm border rounded outline-none cursor-pointer transition-colors ${theme.input}`}>
+                                        <option value="mm">mm</option><option value="cm">cm</option><option value="m">m</option><option value="km">km</option>
+                                      </select>
+                                    </div>
+                                    <div className="flex gap-2 mt-2">
+                                      <button onClick={applyCalibration} disabled={!knownDistance} className={`flex-1 py-1.5 rounded text-xs font-medium disabled:opacity-50 transition-colors ${darkMode ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-amber-500 hover:bg-amber-600 text-white'}`}>Valider</button>
+                                      <button onClick={() => setCalibrationPoints([])} className={`flex-1 py-1.5 rounded text-xs font-medium transition-colors ${darkMode ? 'bg-slate-700 hover:bg-slate-600 text-slate-200' : 'bg-slate-100 hover:bg-slate-200 text-slate-600'}`}>Reprendre</button>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <button onClick={() => { setUnitsPerMeter(null); setMode('calibrate'); setCalibrationPoints([]); }} className={`text-xs hover:underline w-full text-left font-medium ${darkMode ? 'text-amber-400' : 'text-amber-600'}`}>📏 Modifier l'échelle définie</button>
+                        )}
+                      </div>
+                    )}
+
                     <div className="grid grid-cols-2 gap-2">
-                       {mapMode === 'api' && (
-                         <button onClick={() => setMode('auto-select')} className={`col-span-2 py-2 rounded-lg text-xs font-medium flex justify-center gap-2 items-center transition-colors ${mode === 'auto-select' ? 'bg-indigo-600 text-white shadow-md' : theme.buttonSecondary}`}>
-                           ✨ Baguette magique (Auto)
-                         </button>
-                       )}
-                       <button onClick={() => setMode('draw')} className={`col-span-1 py-2 rounded-lg text-xs font-medium transition-colors ${mode === 'draw' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}>
-                         ✏️ Tracer Surface
-                       </button>
-                       <button onClick={() => setMode('measure')} className={`col-span-1 py-2 rounded-lg text-xs font-medium transition-colors ${mode === 'measure' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}>
-                         📏 Mesurer Ligne
-                       </button>
+                      {mapMode === 'api' && (
+                        <button onClick={() => setMode('auto-select')} className={`col-span-2 py-2 rounded-lg text-xs font-medium flex justify-center gap-2 items-center transition-colors ${mode === 'auto-select' ? 'bg-indigo-600 text-white shadow-md' : theme.buttonSecondary}`}>✨ Baguette magique (Auto)</button>
+                      )}
+                      <button disabled={!unitsPerMeter && mapMode === 'local'} onClick={() => setMode('draw')} className={`col-span-1 py-2 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${mode === 'draw' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}>✏️ Tracer Surface</button>
+                      <button disabled={!unitsPerMeter && mapMode === 'local'} onClick={() => setMode('measure')} className={`col-span-1 py-2 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${mode === 'measure' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}>📏 Mesurer Ligne</button>
                     </div>
 
-                    {/* Actions en cours de dessin */}
                     {(mode === 'draw' || mode === 'measure') && currentPoints.length > 0 && (
                       <div className={`pt-3 border-t mt-3 ${theme.borderLight}`}>
-                        {mode === 'draw' && <input type="text" value={parcelName} onChange={(e) => setParcelName(e.target.value)} placeholder="Nom de la parcelle" className={`w-full text-xs p-2 mb-2 border rounded outline-none transition-colors ${theme.input}`} />}
+                        {mode === 'draw' && <input type="text" value={parcelName} onChange={e => setParcelName(e.target.value)} placeholder="Nom de la parcelle" className={`w-full text-xs p-2 mb-2 border rounded outline-none transition-colors ${theme.input}`} />}
                         <div className="flex gap-2">
-                           <button onClick={() => setCurrentPoints(p => p.slice(0, -1))} className={`flex-1 py-2 border rounded-lg text-[10px] font-medium transition-colors ${theme.buttonSecondary}`}>
-                             ↩️ Annuler point
-                           </button>
-                           <button onClick={completePolygon} disabled={currentPoints.length < (mode==='draw'?3:2)} className="flex-1 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 disabled:opacity-50 text-[10px] font-medium transition-colors">
-                             ✅ Terminer
-                           </button>
+                          <button onClick={() => setCurrentPoints(p => p.slice(0, -1))} className={`flex-1 py-2 border rounded-lg text-[10px] font-medium transition-colors ${theme.buttonSecondary}`}>↩️ Annuler point</button>
+                          <button onClick={completePolygon} disabled={currentPoints.length < (mode === 'draw' ? 3 : 2)} className="flex-1 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 disabled:opacity-50 text-[10px] font-medium transition-colors">✅ Terminer</button>
                         </div>
                       </div>
                     )}
@@ -661,127 +963,192 @@
                 </section>
               )}
 
-              {/* 3. Calques */}
+              {/* ── 3. Calques ── */}
               {(polygons.length > 0 || lines.length > 0) && (
                 <section>
                   <div className="flex items-center justify-between mb-3">
                     <h2 className={`text-xs font-bold uppercase tracking-wider ${theme.textMuted}`}>3. Calques</h2>
-                    <select value={displayUnit} onChange={e => setDisplayUnit(e.target.value)} className={`text-xs border rounded p-1 outline-none cursor-pointer transition-colors ${darkMode ? 'bg-slate-900 border-slate-600 text-slate-200 hover:border-indigo-500' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-300'}`}>
+                    <select value={displayUnit} onChange={e => setDisplayUnit(e.target.value)} className={`text-xs border rounded p-1 outline-none cursor-pointer transition-colors ${darkMode ? 'bg-slate-900 border-slate-600 text-slate-200' : 'bg-white border-slate-200 text-slate-600'}`}>
                       <option value="m²">m²</option><option value="ha">ha</option><option value="cm²">cm²</option>
                     </select>
                   </div>
                   <div className="space-y-2">
-                    {polygons.map((poly) => (
+                    {polygons.map(poly => (
                       <div key={poly.id} className={`flex items-center justify-between p-3 border rounded-lg group transition-colors ${theme.panel} ${darkMode ? 'hover:border-indigo-500' : 'hover:border-indigo-300'}`}>
                         <div className="flex items-center gap-3 flex-1 min-w-0">
-                          <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: poly.border }}></div>
+                          <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: poly.border }}/>
                           <div className="min-w-0 flex-1">
                             {editingPolygonId === poly.id ? (
-                              <input autoFocus defaultValue={poly.name} onBlur={(e) => handleRenameSubmit(poly.id, e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleRenameSubmit(poly.id, e.target.value)} className={`w-full text-sm font-medium border-b bg-transparent outline-none ${theme.textTitle} border-indigo-500`} />
+                              <input autoFocus defaultValue={poly.name} onBlur={e => handleRenameSubmit(poly.id, e.target.value)} onKeyDown={e => e.key === 'Enter' && handleRenameSubmit(poly.id, e.target.value)} className={`w-full text-sm font-medium border-b bg-transparent outline-none ${theme.textTitle} border-indigo-500`} />
                             ) : (
                               <p className={`text-sm font-medium truncate cursor-pointer hover:text-indigo-500 transition-colors ${theme.textTitle}`} onClick={() => setEditingPolygonId(poly.id)}>{poly.name}</p>
                             )}
                             <div className="flex items-center gap-1">
-                              {poly.area ? <p className={`text-xs font-semibold ${theme.textMain}`}>{formatArea(poly.area, displayUnit)}</p> : <p className={`text-xs ${theme.textMuted}`}>Non étalonné</p>}
+                              {poly.area != null ? <p className={`text-xs font-semibold ${theme.textMain}`}>{formatAreaFn(poly.area, displayUnit)}</p> : <p className={`text-xs ${theme.textMuted}`}>Non étalonné</p>}
                             </div>
                           </div>
                         </div>
-                        <button onClick={() => setPolygons(p => p.filter(x => x.id !== poly.id))} className={`opacity-0 group-hover:opacity-100 p-1 ${theme.textMuted} hover:text-red-500`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>
+                        <button onClick={() => deletePolygon(poly.id)} className={`opacity-0 group-hover:opacity-100 p-1 flex-shrink-0 ${theme.textMuted} hover:text-red-500`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg></button>
                       </div>
                     ))}
-                    {lines.map((line) => (
+                    {lines.map(line => (
                       <div key={line.id} className={`flex items-center justify-between p-3 border rounded-lg group transition-colors ${theme.panel}`}>
                         <div className="flex items-center gap-3 flex-1 min-w-0">
-                          <div className="w-3 h-1 rounded-full flex-shrink-0" style={{ backgroundColor: line.color }}></div>
+                          <div className="w-3 h-1 rounded-full flex-shrink-0" style={{ backgroundColor: line.color }}/>
                           <div className="min-w-0 flex-1">
                             <p className={`text-sm font-medium truncate ${theme.textTitle}`}>Mesure Linéaire</p>
-                            <p className={`text-xs font-semibold ${theme.textMain}`}>{formatDistance(line.distance)}</p>
+                            <p className={`text-xs font-semibold ${theme.textMain}`}>{formatDistanceFn(line.distance)}</p>
                           </div>
                         </div>
-                        <button onClick={() => setLines(l => l.filter(x => x.id !== line.id))} className={`opacity-0 group-hover:opacity-100 p-1 ${theme.textMuted} hover:text-red-500`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>
+                        <button onClick={() => deleteLine(line.id)} className={`opacity-0 group-hover:opacity-100 p-1 flex-shrink-0 ${theme.textMuted} hover:text-red-500`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg></button>
                       </div>
                     ))}
                   </div>
                 </section>
               )}
-
-              {/* Sauvegarde & Import */}
-              <section className="pt-6 border-t border-slate-200/50">
-                 <div className="flex gap-2">
-                   <button onClick={exportProject} className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-colors ${theme.buttonSecondary}`}>💾 Sauvegarder</button>
-                   <label className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-colors text-center cursor-pointer ${theme.buttonSecondary}`}>
-                     📂 Ouvrir
-                     <input type="file" accept=".json" className="hidden" onChange={importProject} />
-                   </label>
-                 </div>
-              </section>
-
             </div>
+
+            {/* ── Bottom bar ── */}
+            {mapMode !== 'none' && (
+              <div className={`p-4 border-t flex flex-col gap-3 ${theme.sidebar} ${theme.borderLight}`}>
+                <div className="flex gap-2">
+                  <button onClick={exportProject} className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-colors ${theme.buttonSecondary}`}>💾 Sauvegarder</button>
+                  <label className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-colors text-center cursor-pointer ${theme.buttonSecondary}`}>
+                    📂 Ouvrir
+                    <input type="file" accept=".json" className="hidden" onChange={importProject} />
+                  </label>
+                </div>
+                <div className="flex gap-3">
+                  <button onClick={downloadImage} className={`flex-1 py-3 text-white rounded-xl text-xs font-medium transition-all flex items-center justify-center gap-2 shadow-lg active:scale-[0.98] ${darkMode ? 'bg-slate-700 hover:bg-slate-600' : 'bg-slate-900 hover:bg-slate-800'}`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>PNG</button>
+                  <button onClick={downloadPDF} className={`flex-1 py-3 text-white rounded-xl text-xs font-medium transition-all flex items-center justify-center gap-2 shadow-lg active:scale-[0.98] ${darkMode ? 'bg-indigo-500 hover:bg-indigo-400' : 'bg-indigo-600 hover:bg-indigo-700'}`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>PDF</button>
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Zone principale (Carte) */}
+          {/* ═══ MAIN AREA ═══ */}
           <div className={`flex-1 flex flex-col relative z-10 transition-colors duration-200 ${theme.canvasBg}`}>
-            
             {isLoading && (
               <div className={`absolute inset-0 z-50 backdrop-blur-sm flex flex-col items-center justify-center ${darkMode ? 'bg-slate-900/80 text-indigo-300' : 'bg-white/80 text-indigo-900'}`}>
-                 <div className={`w-12 h-12 border-4 rounded-full animate-spin mb-4 ${darkMode ? 'border-indigo-900 border-t-indigo-400' : 'border-indigo-200 border-t-indigo-600'}`}></div>
-                 <p className="font-medium">Chargement...</p>
+                <div className={`w-12 h-12 border-4 rounded-full animate-spin mb-4 ${darkMode ? 'border-indigo-900 border-t-indigo-400' : 'border-indigo-200 border-t-indigo-600'}`}/>
+                <p className="font-medium">Chargement...</p>
               </div>
             )}
 
-            {/* Moteur Slippy Map */}
-            <div 
-              ref={containerRef}
-              className={`flex-1 relative overflow-hidden transition-colors duration-200 ${theme.canvasBg} ${mapMode === 'none' ? '' : (isDragging ? 'cursor-grabbing' : (mode === 'upload' ? 'cursor-grab' : 'cursor-crosshair'))}`}
-              onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
-            >
+            <div className={`h-16 flex items-center justify-between px-6 border-b z-20 shadow-sm transition-colors duration-200 ${theme.topbar}`}>
+              <div className="flex items-center gap-4">
+                <h1 className={`text-lg font-medium ${theme.textTitle}`}>Visionneuse Interactive</h1>
+                {mode === 'auto-select' && <span className={`px-3 py-1 text-xs font-bold rounded-full animate-pulse border ${darkMode ? 'bg-indigo-900/40 text-indigo-300 border-indigo-800' : 'bg-indigo-100 text-indigo-800 border-indigo-200'}`}>✨ Auto-Sélection</span>}
+                {mode === 'calibrate' && <span className={`px-3 py-1 text-xs font-bold rounded-full border ${darkMode ? 'bg-amber-900/40 text-amber-400 border-amber-800' : 'bg-amber-100 text-amber-800 border-amber-200'}`}>📏 Étalonnage</span>}
+                {mode === 'draw' && <span className={`px-3 py-1 text-xs font-bold rounded-full border ${darkMode ? 'bg-slate-800 text-slate-300 border-slate-600' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>✏️ Tracé</span>}
+                {mode === 'measure' && <span className={`px-3 py-1 text-xs font-bold rounded-full border ${darkMode ? 'bg-slate-800 text-slate-300 border-slate-600' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>📏 Mesure</span>}
+              </div>
+              <div className="flex items-center gap-4">
+                {mapMode === 'api' && <span className={`flex items-center gap-1 px-2 py-1 rounded text-sm font-medium ${darkMode ? 'text-emerald-400 bg-emerald-900/30' : 'text-emerald-600 bg-emerald-50'}`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg> API Active</span>}
+                {mapMode === 'local' && unitsPerMeter && <span className={`text-sm font-medium ${theme.textMuted}`}>Échelle définie</span>}
+              </div>
+            </div>
+
+            <div ref={containerRef} className={`flex-1 relative overflow-hidden transition-colors duration-200 ${theme.canvasBg} ${mapMode === 'none' ? '' : (isDraggingState ? 'cursor-grabbing' : (mode === 'upload' ? 'cursor-grab' : 'cursor-crosshair'))}`}>
               {mapMode === 'none' ? (
                 <div className={`absolute inset-0 flex flex-col items-center justify-center max-w-md mx-auto text-center pointer-events-none ${theme.textMuted}`}>
                   <div className={`w-20 h-20 rounded-full flex items-center justify-center mb-6 shadow-inner ${darkMode ? 'bg-indigo-900/20 text-indigo-500' : 'bg-indigo-50 text-indigo-300'}`}>
-                    <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                    <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
                   </div>
                   <p className={`text-xl font-semibold mb-2 ${theme.textTitle}`}>Bienvenue sur surfaces.io</p>
                   <p>Recherchez une adresse ou importez un plan local pour commencer à tracer.</p>
                 </div>
               ) : (
                 <>
-                  <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
-                  
-                  {/* Tableau récapitulatif flottant */}
-                  {Object.keys(areaSummaryByColor).length > 0 && (
-                    <div className={`absolute top-4 right-4 z-30 p-4 rounded-xl shadow-lg border backdrop-blur-md min-w-[220px] cursor-default ${darkMode ? 'bg-slate-900/80 border-slate-700' : 'bg-white/90 border-slate-200'}`} onMouseDown={e=>e.stopPropagation()} onMouseMove={e=>e.stopPropagation()} onWheel={e=>e.stopPropagation()}>
-                      <h3 className={`text-[10px] font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>Récapitulatif</h3>
-                      <div className="space-y-2.5">
-                        {Object.entries(areaSummaryByColor).map(([color, totalArea]) => (
-                          <div key={color} className="flex items-center justify-between gap-6">
-                            <div className="flex items-center gap-2">
-                              <div className="w-3 h-3 rounded-full shadow-sm" style={{ backgroundColor: color }}></div>
+                  <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ pointerEvents: 'none' }} />
+
+                  {/* Floating panels */}
+                  <div className="absolute top-4 right-4 flex flex-col gap-4 z-30 items-end pointer-events-none">
+                    {Object.keys(areaSummaryByColor).length > 0 && (
+                      <div className={`p-4 rounded-xl shadow-lg border backdrop-blur-md min-w-[220px] pointer-events-auto cursor-default ${darkMode ? 'bg-slate-900/80 border-slate-700' : 'bg-white/90 border-slate-200'}`}>
+                        <h3 className={`text-[10px] font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>Récapitulatif</h3>
+                        <div className="space-y-2.5">
+                          {Object.entries(areaSummaryByColor).map(([color, total]) => (
+                            <div key={color} className="flex items-center justify-between gap-6">
+                              <div className="w-3 h-3 rounded-full shadow-sm" style={{ backgroundColor: color }}/>
+                              <span className={`text-sm font-bold ${theme.textMain}`}>{formatAreaFn(total, displayUnit)}</span>
                             </div>
-                            <span className={`text-sm font-bold ${theme.textMain}`}>{formatArea(totalArea, displayUnit)}</span>
-                          </div>
-                        ))}
-                      </div>
-                      <div className={`mt-3 pt-3 border-t flex justify-between items-center ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
-                        <span className={`text-xs font-bold uppercase ${theme.textMuted}`}>Total Global</span>
-                        <span className={`text-sm font-black ${darkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>{formatArea(Object.values(areaSummaryByColor).reduce((a, b) => a + b, 0), displayUnit)}</span>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Contrôles Flottants Carte */}
-                  <div className="absolute bottom-6 right-6 flex flex-col gap-3 z-30 pointer-events-auto" onMouseDown={e=>e.stopPropagation()} onMouseMove={e=>e.stopPropagation()} onWheel={e=>e.stopPropagation()}>
-                     
-                     {mapMode === 'api' && (
-                        <div className={`flex flex-col bg-white rounded-lg shadow-lg border overflow-hidden ${darkMode ? 'bg-slate-800 border-slate-600' : 'bg-white border-slate-200'}`}>
-                           <button onClick={() => setBaseMap('ortho')} className={`px-3 py-2 text-[10px] font-bold uppercase ${baseMap === 'ortho' ? 'bg-indigo-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Satellite</button>
-                           <button onClick={() => setBaseMap('plan')} className={`px-3 py-2 text-[10px] font-bold uppercase border-y ${darkMode ? 'border-slate-700' : 'border-slate-100'} ${baseMap === 'plan' ? 'bg-indigo-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Plan IGN</button>
-                           <button onClick={() => setBaseMap('cadastre')} className={`px-3 py-2 text-[10px] font-bold uppercase ${baseMap === 'cadastre' ? 'bg-indigo-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Lignes</button>
+                          ))}
                         </div>
-                     )}
+                        <div className={`mt-3 pt-3 border-t flex justify-between items-center ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
+                          <span className={`text-xs font-bold uppercase ${theme.textMuted}`}>Total</span>
+                          <span className={`text-sm font-black ${darkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>{formatAreaFn(Object.values(areaSummaryByColor).reduce((a, b) => a + b, 0), displayUnit)}</span>
+                        </div>
+                      </div>
+                    )}
 
-                     <button onClick={handleGeolocate} className={`p-3 rounded-full shadow-lg border flex items-center justify-center transition-transform hover:scale-105 ${darkMode ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-white border-slate-200 text-indigo-600'}`} title="Me localiser">
-                       <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-                     </button>
+                    {activeParcelData && (
+                      <div className={`p-4 rounded-xl shadow-lg border backdrop-blur-md w-[300px] pointer-events-auto ${darkMode ? 'bg-slate-900/95 border-slate-700' : 'bg-white/95 border-slate-200'}`}>
+                        <div className="flex justify-between items-center mb-4 border-b pb-2" style={{ borderColor: darkMode ? '#334155' : '#e2e8f0' }}>
+                          <h3 className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Diagnostic Environnemental</h3>
+                          <button onClick={() => setActiveParcelData(null)} className="text-slate-400 hover:text-red-500 transition-colors">
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                          </button>
+                        </div>
+                        <div className="mb-4 flex items-center gap-3">
+                          <div className={`w-10 h-10 rounded-full flex flex-shrink-0 items-center justify-center ${darkMode ? 'bg-indigo-900/40 text-indigo-400' : 'bg-indigo-50 text-indigo-600'}`}>
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+                          </div>
+                          <div className="overflow-hidden">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <div className={`text-base font-bold truncate ${theme.textTitle}`}>Parcelle {activeParcelData.num}</div>
+                              {activeParcelData.zoning && <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold whitespace-nowrap ${darkMode ? 'bg-sky-900/40 text-sky-400 border border-sky-800' : 'bg-sky-100 text-sky-700 border border-sky-200'}`}>{activeParcelData.zoning}</span>}
+                            </div>
+                            <div className={`text-xs truncate ${theme.textMuted}`}>{activeParcelData.city || 'Localisation...'}</div>
+                          </div>
+                        </div>
+
+                        {activeParcelData.isLoading ? (
+                          <div className="space-y-2 animate-pulse mt-2">
+                            <div className={`h-2.5 rounded w-3/4 ${darkMode ? 'bg-slate-700' : 'bg-slate-200'}`}/><div className={`h-2.5 rounded w-1/2 ${darkMode ? 'bg-slate-700' : 'bg-slate-200'}`}/><div className={`h-2.5 rounded w-5/6 ${darkMode ? 'bg-slate-700' : 'bg-slate-200'}`}/>
+                            <p className={`text-[10px] mt-4 text-center ${theme.textMuted}`}>Interrogation des bases de l'État...</p>
+                          </div>
+                        ) : (
+                          <div className="max-h-[35vh] overflow-y-auto pr-1 custom-scrollbar">
+                            <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Risques Répertoriés</div>
+                            {activeParcelData.risks?.length > 0 ? (
+                              <div className="space-y-2">
+                                {activeParcelData.risks.map((risk, idx) => (
+                                  <a key={idx} href={risk.url} target="_blank" rel="noreferrer" className={`group text-[11px] font-medium p-2.5 rounded-lg flex items-start gap-2.5 border transition-colors ${darkMode ? 'bg-slate-800/50 border-slate-700/50 text-slate-300 hover:bg-slate-700 hover:border-indigo-500' : 'bg-slate-50 border-slate-200/50 text-slate-700 hover:bg-white hover:border-indigo-300'}`}>
+                                    <span className="text-amber-500 flex-shrink-0 leading-none mt-0.5">⚠️</span>
+                                    <div className="flex-1 flex flex-col gap-1.5">
+                                      <span className="leading-snug group-hover:text-indigo-500 transition-colors">{risk.name}</span>
+                                      <span className={`self-start text-[8px] uppercase font-bold px-1.5 py-0.5 rounded ${darkMode ? 'bg-slate-700 text-slate-400' : 'bg-slate-200 text-slate-500'}`}>🏘️ {risk.scope}</span>
+                                    </div>
+                                    <svg className={`w-3 h-3 flex-shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 transition-opacity ${theme.textMuted}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                                  </a>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className={`text-[11px] font-medium p-3 rounded-lg border ${darkMode ? 'bg-emerald-900/20 border-emerald-800/50 text-emerald-400' : 'bg-emerald-50 border-emerald-200 text-emerald-700'}`}>✅ Aucun risque majeur répertorié.</div>
+                            )}
+                            <div className="mt-4 pt-3 border-t flex flex-col gap-2" style={{ borderColor: darkMode ? '#334155' : '#e2e8f0' }}>
+                              <a href={activeParcelData.reportUrl} target="_blank" rel="noreferrer" className={`w-full py-2 rounded text-[10px] font-bold uppercase tracking-wider text-center transition-colors block ${darkMode ? 'bg-indigo-600 hover:bg-indigo-500 text-white' : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'}`}>📄 Rapport détaillé</a>
+                              <p className={`text-[9px] text-center ${theme.textMuted}`}>Source : ERRIAL / Géorisques</p>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Bottom-right controls */}
+                  <div className="absolute bottom-6 right-6 flex flex-col gap-3 z-30 pointer-events-auto">
+                    {mapMode === 'api' && (
+                      <div className={`flex flex-col rounded-lg shadow-lg border overflow-hidden ${darkMode ? 'bg-slate-800 border-slate-600' : 'bg-white border-slate-200'}`}>
+                        <button onClick={() => setBaseMap('ortho')} className={`px-3 py-2 text-[10px] font-bold uppercase ${baseMap === 'ortho' ? 'bg-indigo-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Satellite</button>
+                        <button onClick={() => setBaseMap('plan')} className={`px-3 py-2 text-[10px] font-bold uppercase border-y ${darkMode ? 'border-slate-700' : 'border-slate-100'} ${baseMap === 'plan' ? 'bg-indigo-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Plan IGN</button>
+                        <button onClick={() => setBaseMap('cadastre')} className={`px-3 py-2 text-[10px] font-bold uppercase ${baseMap === 'cadastre' ? 'bg-indigo-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Lignes</button>
+                      </div>
+                    )}
+                    <button onClick={handleGeolocate} className={`p-3 rounded-full shadow-lg border flex items-center justify-center transition-transform hover:scale-105 ${darkMode ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-white border-slate-200 text-indigo-600'}`} title="Me localiser">
+                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                    </button>
                   </div>
                 </>
               )}
@@ -791,8 +1158,7 @@
       );
     }
 
-    const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(<App />);
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
 </html>
