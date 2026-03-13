@@ -5,35 +5,27 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>surfaces.io - Éditeur Cadastral</title>
   
-  <!-- Chargement de Tailwind CSS pour le design -->
   <script src="https://cdn.tailwindcss.com"></script>
-  
-  <!-- Chargement de React -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  
-  <!-- Chargement de Babel pour traduire le code React en direct -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   
   <style>
-    /* Empêche le défilement inutile sur la page */
     body, html { margin: 0; padding: 0; overflow: hidden; background-color: #f8fafc; }
+    /* Style pour le slider d'opacité */
+    input[type=range] { accent-color: #4f46e5; }
   </style>
 </head>
 <body>
-  <!-- C'est ici que l'application va s'afficher -->
   <div id="root"></div>
 
-  <!-- Le code de notre application -->
   <script type="text/babel">
     const { useState, useRef, useEffect, useMemo } = React;
 
-    // Constantes cartographiques (Web Mercator EPSG:3857)
     const R = 6378137; 
     const ORIGIN_SHIFT = 2 * Math.PI * R / 2.0;
     const INITIAL_RESOLUTION = 2 * Math.PI * R / 256.0;
 
-    // Conversion Géographie <=> Pixels Canvas
     const pxToGeo = (px, py, vp) => ({
       x: vp.center.x + (px - vp.width / 2) * vp.resolution,
       y: vp.center.y - (py - vp.height / 2) * vp.resolution
@@ -43,7 +35,6 @@
       y: vp.height / 2 - (gy - vp.center.y) / vp.resolution
     });
 
-    // Conversion Géographie <=> Tuiles XYZ
     const getTileAtGeo = (gx, gy, z) => {
       const res = INITIAL_RESOLUTION / Math.pow(2, z);
       const px = (gx + ORIGIN_SHIFT) / res;
@@ -57,7 +48,6 @@
       return { gx: px * res - ORIGIN_SHIFT, gy: ORIGIN_SHIFT - py * res };
     };
 
-    // Utilitaire pour convertir une couleur Hex (#RRGGBB) en RGBA pour la transparence
     const hexToRgba = (hex, alpha) => {
       const cleanHex = hex.replace('#', '');
       const r = parseInt(cleanHex.substring(0, 2), 16);
@@ -67,35 +57,31 @@
     };
 
     function App() {
-      // --- STATE DU MOTEUR CARTOGRAPHIQUE ---
       const [viewport, setViewport] = useState({ center: { x: 0, y: 0 }, resolution: 0.5, width: 800, height: 600 });
       const [mapMode, setMapMode] = useState('none'); 
       const [renderTrigger, setRenderTrigger] = useState(0); 
       const [darkMode, setDarkMode] = useState(false);
       
-      // Interactions
       const [polygons, setPolygons] = useState([]);
+      const [lines, setLines] = useState([]); // Nouveau: pour l'outil règle
       const [currentPoints, setCurrentPoints] = useState([]);
-      const [mode, setMode] = useState('upload'); 
+      const [mode, setMode] = useState('upload'); // 'auto-select', 'draw', 'measure', 'calibrate'
       const [isLoading, setIsLoading] = useState(false);
+      const [baseMap, setBaseMap] = useState('ortho'); // 'ortho', 'plan', 'cadastre'
       
-      // Drag / Pan
       const [isDragging, setIsDragging] = useState(false);
       const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
       const [dragMoved, setDragMoved] = useState(false);
       
-      // Refs
       const containerRef = useRef(null);
       const canvasRef = useRef(null);
       const tileCache = useRef({}); 
       
-      // API State
       const [addressQuery, setAddressQuery] = useState('');
       const [addressResults, setAddressResults] = useState([]);
       const [isSearching, setIsSearching] = useState(false);
       const [searchError, setSearchError] = useState('');
       
-      // Image Locale
       const [localImage, setLocalImage] = useState(null);
       const [calibrationPoints, setCalibrationPoints] = useState([]);
       const [knownDistance, setKnownDistance] = useState('');
@@ -103,12 +89,11 @@
       const [calibrationUnit, setCalibrationUnit] = useState('m');
       const [displayUnit, setDisplayUnit] = useState('m²');
       
-      // Drawing state
       const [activeColor, setActiveColor] = useState('#ef4444');
       const [parcelName, setParcelName] = useState('Parcelle A');
       const [editingPolygonId, setEditingPolygonId] = useState(null);
+      const [polygonOpacity, setPolygonOpacity] = useState(0.5); // Transparence ajustable
 
-      // Helper pour formater l'affichage des surfaces dynamiquement
       const formatArea = (sqMeters, unit) => {
         if (sqMeters === null || sqMeters === undefined) return '';
         switch (unit) {
@@ -120,19 +105,19 @@
           default: return sqMeters.toLocaleString('fr-FR', { maximumFractionDigits: 2 }) + ' m²';
         }
       };
+
+      const formatDistance = (meters) => {
+        if (meters < 1000) return `${meters.toLocaleString('fr-FR', { maximumFractionDigits: 2 })} m`;
+        return `${(meters/1000).toLocaleString('fr-FR', { maximumFractionDigits: 2 })} km`;
+      };
       
       const presetColors = [
-        { label: 'Rouge', hex: '#ef4444' },
-        { label: 'Rose', hex: '#ec4899' },
-        { label: 'Violet', hex: '#a855f7' },
-        { label: 'Bleu', hex: '#3b82f6' },
-        { label: 'Cyan', hex: '#06b6d4' },
-        { label: 'Vert', hex: '#22c55e' },
-        { label: 'Jaune', hex: '#eab308' },
-        { label: 'Orange', hex: '#f97316' },
+        { label: 'Rouge', hex: '#ef4444' }, { label: 'Rose', hex: '#ec4899' },
+        { label: 'Violet', hex: '#a855f7' }, { label: 'Bleu', hex: '#3b82f6' },
+        { label: 'Cyan', hex: '#06b6d4' }, { label: 'Vert', hex: '#22c55e' },
+        { label: 'Jaune', hex: '#eab308' }, { label: 'Orange', hex: '#f97316' },
       ];
 
-      // --- DERIVED STATE : RÉCAPITULATIF DES SURFACES ---
       const areaSummaryByColor = useMemo(() => {
         const summary = {};
         polygons.forEach(poly => {
@@ -144,7 +129,6 @@
         return summary;
       }, [polygons]);
 
-      // --- OBSERVATEUR DE REDIMENSIONNEMENT ---
       useEffect(() => {
         const observer = new ResizeObserver(entries => {
           for (let entry of entries) {
@@ -155,62 +139,39 @@
         return () => observer.disconnect();
       }, []);
 
-      // --- RECHERCHE D'ADRESSE AUTOMATIQUE ---
       useEffect(() => {
         const query = addressQuery.trim();
-        if (query.length < 3) {
-          setAddressResults([]);
-          setSearchError('');
-          return;
-        }
-
+        if (query.length < 3) { setAddressResults([]); setSearchError(''); return; }
         setIsSearching(true);
         const controller = new AbortController();
-        
         const timer = setTimeout(async () => {
           try {
             const res = await fetch(`https://api-adresse.data.gouv.fr/search/?q=${encodeURIComponent(query)}&limit=5`, { signal: controller.signal });
             if (!res.ok) throw new Error();
             const data = await res.json();
             if (data && data.features && data.features.length > 0) {
-              setAddressResults(data.features);
-              setSearchError('');
+              setAddressResults(data.features); setSearchError('');
             } else {
-              setAddressResults([]);
-              setSearchError('Aucune adresse trouvée.');
+              setAddressResults([]); setSearchError('Aucune adresse trouvée.');
             }
           } catch (err) {
             if (err.name !== 'AbortError') setSearchError('Erreur de connexion avec le serveur.');
-          } finally {
-            setIsSearching(false);
-          }
+          } finally { setIsSearching(false); }
         }, 400);
-
-        return () => {
-          clearTimeout(timer);
-          controller.abort();
-        };
+        return () => { clearTimeout(timer); controller.abort(); };
       }, [addressQuery]);
 
       const loadMapFromAddress = (feature) => {
         setAddressResults([]);
         setAddressQuery(feature.properties.label);
-        
         const lon = feature.geometry.coordinates[0];
         const lat = feature.geometry.coordinates[1];
         const x = (lon * Math.PI / 180) * R;
         const y = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) * R;
-        
         setViewport(v => ({ ...v, center: { x, y }, resolution: 0.5 })); 
-        setMapMode('api');
-        setPolygons([]);
-        setCurrentPoints([]);
-        setUnitsPerMeter(null);
-        setMode('auto-select');
-        setParcelName('Parcelle A');
+        setMapMode('api'); setMode('auto-select'); setParcelName('Parcelle A');
       };
 
-      // --- API CARTO (IGN) ---
       const fetchParcelFromClick = async (lon, lat) => {
         setIsLoading(true);
         try {
@@ -218,42 +179,53 @@
           const res = await fetch(`https://apicarto.ign.fr/api/cadastre/parcelle?geom=${geomQuery}`);
           if (!res.ok) throw new Error();
           const data = await res.json();
-          
           if (data.features && data.features.length > 0) {
             const parcel = data.features[0];
             const num = parcel.properties.numero;
             let rings = parcel.geometry.type === 'Polygon' ? [parcel.geometry.coordinates[0]] : parcel.geometry.coordinates.map(p => p[0]);
-            
             const geoPoints = rings[0].map(coord => ({
-              x: (coord[0] * Math.PI / 180) * R,
-              y: Math.log(Math.tan(Math.PI / 4 + (coord[1] * Math.PI / 180) / 2)) * R
+              x: (coord[0] * Math.PI / 180) * R, y: Math.log(Math.tan(Math.PI / 4 + (coord[1] * Math.PI / 180) / 2)) * R
             }));
-
             setPolygons([...polygons, { 
-              id: Date.now(), name: `Parcelle ${num}`, points: geoPoints, 
-              fill: hexToRgba(activeColor, 0.5), border: activeColor, area: parcel.properties.contenance, isOfficial: true
+              id: Date.now(), name: `Parcelle ${num}`, points: geoPoints, border: activeColor, area: parcel.properties.contenance, isOfficial: true
             }]);
           }
-        } catch (err) {
-          alert("Impossible de récupérer la géométrie de l'État.");
-        }
+        } catch (err) { alert("Impossible de récupérer la géométrie de l'État."); }
         setIsLoading(false);
       };
 
-      // --- NAVIGATION (PAN & ZOOM) ---
+      // --- GPS (ME LOCALISER) ---
+      const handleGeolocate = () => {
+        if (!navigator.geolocation) return alert("Géolocalisation non supportée par votre navigateur.");
+        setIsLoading(true);
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            const lon = position.coords.longitude;
+            const lat = position.coords.latitude;
+            const x = (lon * Math.PI / 180) * R;
+            const y = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) * R;
+            setViewport(v => ({ ...v, center: { x, y }, resolution: 0.5 })); 
+            setMapMode('api');
+            setMode('auto-select');
+            setIsLoading(false);
+          },
+          (error) => {
+            alert("Impossible de vous localiser. Vérifiez vos permissions.");
+            setIsLoading(false);
+          }
+        );
+      };
+
       const handleWheel = (e) => {
         e.preventDefault();
         if (mapMode === 'none') return;
-        
         const factor = Math.exp(-e.deltaY * 0.002);
         let newRes = viewport.resolution / factor;
         newRes = Math.max(0.05, Math.min(newRes, mapMode === 'api' ? 100 : 10));
-
         const rect = containerRef.current.getBoundingClientRect();
         const mouseGeo = pxToGeo(e.clientX - rect.left, e.clientY - rect.top, viewport);
         const newCx = mouseGeo.x - (e.clientX - rect.left - viewport.width / 2) * newRes;
         const newCy = mouseGeo.y + (e.clientY - rect.top - viewport.height / 2) * newRes;
-
         setViewport(v => ({ ...v, center: { x: newCx, y: newCy }, resolution: newRes }));
       };
 
@@ -267,103 +239,98 @@
 
       const handleMouseDown = (e) => {
         if (mapMode === 'none') return;
-        setIsDragging(true);
-        setDragMoved(false);
-        setDragStart({ x: e.clientX, y: e.clientY });
+        setIsDragging(true); setDragMoved(false); setDragStart({ x: e.clientX, y: e.clientY });
       };
 
       const handleMouseMove = (e) => {
         if (!isDragging) return;
-        const dx = e.clientX - dragStart.x;
-        const dy = e.clientY - dragStart.y;
+        const dx = e.clientX - dragStart.x; const dy = e.clientY - dragStart.y;
         if (Math.abs(dx) > 3 || Math.abs(dy) > 3) setDragMoved(true);
-        
-        setViewport(v => ({
-          ...v,
-          center: { x: v.center.x - dx * v.resolution, y: v.center.y + dy * v.resolution }
-        }));
+        setViewport(v => ({ ...v, center: { x: v.center.x - dx * v.resolution, y: v.center.y + dy * v.resolution } }));
         setDragStart({ x: e.clientX, y: e.clientY });
       };
 
       const handleMouseUp = (e) => {
         if (!isDragging) return;
         setIsDragging(false);
-        
         if (!dragMoved && mapMode !== 'none') {
           const rect = containerRef.current.getBoundingClientRect();
-          const px = e.clientX - rect.left;
-          const py = e.clientY - rect.top;
-          const geo = pxToGeo(px, py, viewport);
-
+          const geo = pxToGeo(e.clientX - rect.left, e.clientY - rect.top, viewport);
           if (mode === 'auto-select' && mapMode === 'api') {
             const lon = (geo.x / R) * 180 / Math.PI;
             const lat = (2 * Math.atan(Math.exp(geo.y / R)) - Math.PI / 2) * 180 / Math.PI;
             fetchParcelFromClick(lon, lat);
           } 
-          else if (mode === 'calibrate') {
-            if (calibrationPoints.length < 2) setCalibrationPoints([...calibrationPoints, geo]);
-          } 
-          else if (mode === 'draw') {
-            setCurrentPoints([...currentPoints, geo]);
-          }
+          else if (mode === 'calibrate' && calibrationPoints.length < 2) setCalibrationPoints([...calibrationPoints, geo]);
+          else if (mode === 'draw' || mode === 'measure') setCurrentPoints([...currentPoints, geo]);
         }
       };
 
-      // --- MOTEUR DE TUILES (WMTS) ---
       const getTile = (layer, z, x, y) => {
         const key = `${layer}_${z}_${x}_${y}`;
         if (tileCache.current[key]) return tileCache.current[key];
-
         let url = '';
-        if (layer === 'ortho') {
-          url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
-        } else if (layer === 'cadastre') {
-          url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=CADASTRALPARCELS.PARCELLAIRE_EXPRESS&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
-        }
-
+        if (layer === 'ortho') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
+        else if (layer === 'plan') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
+        else if (layer === 'cadastre') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=CADASTRALPARCELS.PARCELLAIRE_EXPRESS&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
+        
         const tile = { loaded: false, img: new Image() };
         tileCache.current[key] = tile;
-        
         tile.img.crossOrigin = "anonymous";
-        tile.img.onload = () => {
-          tile.loaded = true;
-          setRenderTrigger(prev => prev + 1); 
-        };
+        tile.img.onload = () => { tile.loaded = true; setRenderTrigger(prev => prev + 1); };
         tile.img.onerror = () => { tile.error = true; };
         tile.img.src = url;
-
         return tile;
       };
 
-      // --- RENDU CANVAS ---
+      // Calcul de distance linéaire
+      const calculateDistance = (pts) => {
+        let dist = 0;
+        for(let i=1; i<pts.length; i++) {
+           const dx = pts[i].x - pts[i-1].x;
+           const dy = pts[i].y - pts[i-1].y;
+           dist += Math.sqrt(dx*dx + dy*dy);
+        }
+        if (mapMode === 'api') {
+           const centerLat = (2 * Math.atan(Math.exp(viewport.center.y / R)) - Math.PI / 2) * 180 / Math.PI;
+           dist *= Math.cos(centerLat * Math.PI / 180);
+        } else if (unitsPerMeter) {
+           dist /= unitsPerMeter;
+        }
+        return dist;
+      };
+
       useEffect(() => {
         const canvas = canvasRef.current;
         if (!canvas || viewport.width === 0 || mapMode === 'none') return;
-
         const dpr = window.devicePixelRatio || 1;
-        canvas.width = viewport.width * dpr;
-        canvas.height = viewport.height * dpr;
-        canvas.style.width = `${viewport.width}px`;
-        canvas.style.height = `${viewport.height}px`;
-
+        canvas.width = viewport.width * dpr; canvas.height = viewport.height * dpr;
+        canvas.style.width = `${viewport.width}px`; canvas.style.height = `${viewport.height}px`;
         const ctx = canvas.getContext('2d');
         ctx.scale(dpr, dpr);
         ctx.clearRect(0, 0, viewport.width, viewport.height);
 
-        // 1. Fond de carte
+        // Fond blanc pur pour le mode plan / cadastre
+        if (baseMap === 'cadastre') {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0,0, viewport.width, viewport.height);
+        }
+
         if (mapMode === 'api') {
           let z = Math.round(Math.log2(INITIAL_RESOLUTION / viewport.resolution));
           z = Math.max(0, Math.min(19, z));
-
           const vpMinX = viewport.center.x - (viewport.width / 2) * viewport.resolution;
           const vpMaxX = viewport.center.x + (viewport.width / 2) * viewport.resolution;
           const vpMinY = viewport.center.y - (viewport.height / 2) * viewport.resolution;
           const vpMaxY = viewport.center.y + (viewport.height / 2) * viewport.resolution;
-
           const minTile = getTileAtGeo(vpMinX, vpMaxY, z);
           const maxTile = getTileAtGeo(vpMaxX, vpMinY, z);
 
-          const layers = ['ortho', 'cadastre'];
+          // Gestion dynamique des couches
+          const layers = [];
+          if (baseMap === 'ortho') layers.push('ortho', 'cadastre');
+          else if (baseMap === 'plan') layers.push('plan', 'cadastre');
+          else if (baseMap === 'cadastre') layers.push('cadastre');
 
           layers.forEach(layer => {
             for (let tx = minTile.tx; tx <= maxTile.tx; tx++) {
@@ -373,20 +340,15 @@
                 const geoBR = getGeoAtTile(tx + 1, ty + 1, z);
                 const pxTL = geoToPx(geoTL.gx, geoTL.gy, viewport);
                 const pxBR = geoToPx(geoBR.gx, geoBR.gy, viewport);
-                
-                const w = Math.ceil(pxBR.x - pxTL.x) + 1;
-                const h = Math.ceil(pxBR.y - pxTL.y) + 1;
+                const w = Math.ceil(pxBR.x - pxTL.x) + 1; const h = Math.ceil(pxBR.y - pxTL.y) + 1;
 
                 if (tile.loaded) {
                   ctx.drawImage(tile.img, Math.floor(pxTL.x), Math.floor(pxTL.y), w, h);
                 } else if (!tile.error && layer === 'ortho') {
-                  const pTx = Math.floor(tx / 2);
-                  const pTy = Math.floor(ty / 2);
+                  const pTx = Math.floor(tx / 2); const pTy = Math.floor(ty / 2);
                   const parentTile = tileCache.current[`${layer}_${z-1}_${pTx}_${pTy}`];
-                  
                   if (parentTile && parentTile.loaded) {
-                    const sX = (tx % 2) * 128; 
-                    const sY = (ty % 2) * 128;
+                    const sX = (tx % 2) * 128; const sY = (ty % 2) * 128;
                     ctx.drawImage(parentTile.img, sX, sY, 128, 128, Math.floor(pxTL.x), Math.floor(pxTL.y), w, h);
                   } else {
                     ctx.fillStyle = darkMode ? '#0f172a' : '#e2e8f0';
@@ -402,146 +364,98 @@
           ctx.drawImage(localImage, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
         }
 
-        // 2. Étalonnage
-        if (calibrationPoints.length > 0) {
-          ctx.strokeStyle = '#f59e0b';
-          ctx.lineWidth = 4;
-          ctx.beginPath();
-          const pt1 = geoToPx(calibrationPoints[0].x, calibrationPoints[0].y, viewport);
-          ctx.moveTo(pt1.x, pt1.y);
-          if (calibrationPoints.length === 2) {
-            const pt2 = geoToPx(calibrationPoints[1].x, calibrationPoints[1].y, viewport);
-            ctx.lineTo(pt2.x, pt2.y);
-          } else if (mode === 'calibrate') {
-            ctx.arc(pt1.x, pt1.y, 5, 0, 2 * Math.PI);
-          }
-          ctx.stroke();
-          calibrationPoints.forEach(pt => {
-            const pxPt = geoToPx(pt.x, pt.y, viewport);
-            ctx.fillStyle = '#fff';
-            ctx.beginPath();
-            ctx.arc(pxPt.x, pxPt.y, 6, 0, 2 * Math.PI);
-            ctx.fill();
-            ctx.stroke();
-          });
-        }
+        // Lignes (Outil Règle)
+        lines.forEach(line => {
+           ctx.strokeStyle = line.color;
+           ctx.lineWidth = 4;
+           ctx.beginPath();
+           line.points.forEach((pt, idx) => {
+             const px = geoToPx(pt.x, pt.y, viewport);
+             if(idx===0) ctx.moveTo(px.x, px.y); else ctx.lineTo(px.x, px.y);
+           });
+           ctx.stroke();
+           
+           // Affiche la distance au dernier point
+           const lastPt = geoToPx(line.points[line.points.length-1].x, line.points[line.points.length-1].y, viewport);
+           ctx.fillStyle = 'white'; ctx.font = 'bold 14px sans-serif';
+           ctx.strokeStyle = 'black'; ctx.lineWidth = 3;
+           const text = formatDistance(line.distance);
+           ctx.strokeText(text, lastPt.x + 10, lastPt.y);
+           ctx.fillText(text, lastPt.x + 10, lastPt.y);
+        });
 
-        // 3. Système anti-collision et dessin des polygones
         const drawnLabelsBoxes = [];
         const checkCollision = (box1, box2) => {
           const margin = 4;
-          return !(box2.left > box1.right + margin || 
-                   box2.right < box1.left - margin || 
-                   box2.top > box1.bottom + margin ||
-               box2.bottom < box1.top - margin);
+          return !(box2.left > box1.right + margin || box2.right < box1.left - margin || box2.top > box1.bottom + margin || box2.bottom < box1.top - margin);
         };
 
         polygons.forEach((poly) => {
-          ctx.fillStyle = poly.fill;
+          ctx.fillStyle = hexToRgba(poly.border, polygonOpacity);
           ctx.strokeStyle = poly.border;
           ctx.lineWidth = 3;
           ctx.beginPath();
           poly.points.forEach((pt, index) => {
             const pxPt = geoToPx(pt.x, pt.y, viewport);
-            if (index === 0) ctx.moveTo(pxPt.x, pxPt.y);
-            else ctx.lineTo(pxPt.x, pxPt.y);
+            if (index === 0) ctx.moveTo(pxPt.x, pxPt.y); else ctx.lineTo(pxPt.x, pxPt.y);
           });
-          ctx.closePath();
-          ctx.fill();
-          ctx.stroke();
+          ctx.closePath(); ctx.fill(); ctx.stroke();
           
           if (poly.points.length > 0) {
             const pxPoints = poly.points.map(pt => geoToPx(pt.x, pt.y, viewport));
-            const minX = Math.min(...pxPoints.map(p => p.x));
-            const maxX = Math.max(...pxPoints.map(p => p.x));
-            const minY = Math.min(...pxPoints.map(p => p.y));
-            const maxY = Math.max(...pxPoints.map(p => p.y));
-            
-            let targetX = minX + (maxX - minX) / 2;
-            let targetY = minY + (maxY - minY) / 2;
+            const minX = Math.min(...pxPoints.map(p => p.x)); const maxX = Math.max(...pxPoints.map(p => p.x));
+            const minY = Math.min(...pxPoints.map(p => p.y)); const maxY = Math.max(...pxPoints.map(p => p.y));
+            let targetX = minX + (maxX - minX) / 2; let targetY = minY + (maxY - minY) / 2;
 
-            ctx.fillStyle = 'white';
-            ctx.font = '900 18px sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            
+            ctx.fillStyle = 'white'; ctx.font = '900 18px sans-serif';
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
             const nameText = poly.name;
             const areaText = poly.area !== null && poly.area !== undefined ? `${formatArea(poly.area, displayUnit)}` : '';
-            
             const nameMetrics = ctx.measureText(nameText);
             const areaMetrics = areaText ? ctx.measureText(areaText) : { width: 0 };
             const textWidth = Math.max(nameMetrics.width, areaMetrics.width) + 10;
             const textHeight = areaText ? 50 : 25; 
 
-            let collision = true;
-            let attempt = 0;
-            let angle = 0;
-            let radius = 0;
-            
+            let collision = true; let attempt = 0; let angle = 0; let radius = 0;
             while (collision && attempt < 50) {
-                const currentBox = {
-                    left: targetX - textWidth / 2,
-                    right: targetX + textWidth / 2,
-                    top: targetY - textHeight / 2,
-                    bottom: targetY + textHeight / 2
-                };
-
+                const currentBox = { left: targetX - textWidth/2, right: targetX + textWidth/2, top: targetY - textHeight/2, bottom: targetY + textHeight/2 };
                 collision = drawnLabelsBoxes.some(drawnBox => checkCollision(currentBox, drawnBox));
-
                 if (collision) {
-                    attempt++;
-                    angle += Math.PI / 4; 
-                    radius += 4; 
+                    attempt++; angle += Math.PI / 4; radius += 4; 
                     targetX = (minX + (maxX - minX) / 2) + Math.cos(angle) * radius;
                     targetY = (minY + (maxY - minY) / 2) + Math.sin(angle) * radius;
-                } else {
-                    drawnLabelsBoxes.push(currentBox);
-                }
+                } else { drawnLabelsBoxes.push(currentBox); }
             }
 
-            ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-            ctx.lineWidth = 4;
-            
+            ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 4;
             const yOffsetName = areaText ? -12 : 0;
-            ctx.strokeText(nameText, targetX, targetY + yOffsetName);
-            ctx.fillText(nameText, targetX, targetY + yOffsetName);
-            
-            if (areaText) {
-              ctx.strokeText(areaText, targetX, targetY + 14);
-              ctx.fillText(areaText, targetX, targetY + 14);
-            }
+            ctx.strokeText(nameText, targetX, targetY + yOffsetName); ctx.fillText(nameText, targetX, targetY + yOffsetName);
+            if (areaText) { ctx.strokeText(areaText, targetX, targetY + 14); ctx.fillText(areaText, targetX, targetY + 14); }
           }
         });
 
-        if (currentPoints.length > 0 && mode === 'draw') {
-          ctx.fillStyle = activeColor; 
-          ctx.strokeStyle = activeColor;
-          ctx.lineWidth = 3;
-          
+        // Dessin en cours
+        if (currentPoints.length > 0 && (mode === 'draw' || mode === 'measure')) {
+          ctx.fillStyle = activeColor; ctx.strokeStyle = activeColor; ctx.lineWidth = 3;
           ctx.beginPath();
           currentPoints.forEach((pt, index) => {
             const pxPt = geoToPx(pt.x, pt.y, viewport);
-            if (index === 0) ctx.moveTo(pxPt.x, pxPt.y);
-            else ctx.lineTo(pxPt.x, pxPt.y);
+            if (index === 0) ctx.moveTo(pxPt.x, pxPt.y); else ctx.lineTo(pxPt.x, pxPt.y);
             ctx.fillRect(pxPt.x - 5, pxPt.y - 5, 10, 10);
           });
           ctx.stroke();
           
-          if (currentPoints.length > 2) {
+          if (mode === 'draw' && currentPoints.length > 2) {
             ctx.beginPath();
             const lastPt = geoToPx(currentPoints[currentPoints.length - 1].x, currentPoints[currentPoints.length - 1].y, viewport);
             const firstPt = geoToPx(currentPoints[0].x, currentPoints[0].y, viewport);
-            ctx.moveTo(lastPt.x, lastPt.y);
-            ctx.lineTo(firstPt.x, firstPt.y);
-            ctx.setLineDash([5, 5]);
-            ctx.stroke();
-            ctx.setLineDash([]);
+            ctx.moveTo(lastPt.x, lastPt.y); ctx.lineTo(firstPt.x, firstPt.y);
+            ctx.setLineDash([5, 5]); ctx.stroke(); ctx.setLineDash([]);
           }
         }
 
-      }, [viewport, renderTrigger, polygons, currentPoints, activeColor, calibrationPoints, mode, displayUnit, mapMode, localImage, darkMode]);
+      }, [viewport, renderTrigger, polygons, lines, currentPoints, activeColor, calibrationPoints, mode, displayUnit, mapMode, localImage, darkMode, polygonOpacity, baseMap]);
 
-      // --- ACTIONS ---
       const handleImageUpload = (e) => {
         const file = e.target.files[0];
         if (file) {
@@ -549,19 +463,10 @@
           reader.onload = (event) => {
             const img = new Image();
             img.onload = () => {
-              setLocalImage(img);
-              setMapMode('local');
-              setViewport(v => ({
-                ...v,
-                center: { x: img.width / 2, y: img.height / 2 },
-                resolution: Math.max(img.width / v.width, img.height / v.height) * 1.05
-              }));
-              setPolygons([]);
-              setCurrentPoints([]);
-              setCalibrationPoints([]);
-              setUnitsPerMeter(null);
-              setMode('calibrate');
-              setParcelName('Surface A');
+              setLocalImage(img); setMapMode('local');
+              setViewport(v => ({ ...v, center: { x: img.width / 2, y: img.height / 2 }, resolution: Math.max(img.width / v.width, img.height / v.height) * 1.05 }));
+              setPolygons([]); setLines([]); setCurrentPoints([]); setCalibrationPoints([]); setUnitsPerMeter(null);
+              setMode('calibrate'); setParcelName('Surface A');
             };
             img.src = event.target.result;
           };
@@ -569,44 +474,14 @@
         }
       };
 
-      const applyCalibration = () => {
-        if (calibrationPoints.length === 2 && knownDistance > 0) {
-          const dx = calibrationPoints[1].x - calibrationPoints[0].x;
-          const dy = calibrationPoints[1].y - calibrationPoints[0].y;
-          const distUnits = Math.sqrt(dx * dx + dy * dy);
-          
-          let multiplier = 1;
-          if (calibrationUnit === 'mm') multiplier = 0.001;
-          else if (calibrationUnit === 'cm') multiplier = 0.01;
-          else if (calibrationUnit === 'km') multiplier = 1000;
-          
-          const distanceInMeters = parseFloat(knownDistance) * multiplier;
-          const newUnitsPerMeter = distUnits / distanceInMeters;
-          
-          setUnitsPerMeter(newUnitsPerMeter);
-          setMode('draw');
-
-          setPolygons(prev => prev.map(poly => {
-            if (poly.isOfficial) return poly; 
-            
-            let areaPx = 0;
-            for (let i = 0; i < poly.points.length; i++) {
-              const j = (i + 1) % poly.points.length;
-              areaPx += poly.points[i].x * poly.points[j].y;
-              areaPx -= poly.points[j].x * poly.points[i].y;
-            }
-            areaPx = Math.abs(areaPx) / 2;
-            
-            return { ...poly, area: areaPx / (newUnitsPerMeter * newUnitsPerMeter) };
-          }));
-        }
-      };
-
       const completePolygon = () => {
-        if (currentPoints.length >= 3) {
-          let realArea = null;
-          
-          let area = 0;
+        if (mode === 'measure' && currentPoints.length >= 2) {
+           const dist = calculateDistance(currentPoints);
+           setLines([...lines, { id: Date.now(), points: currentPoints, color: activeColor, distance: dist }]);
+           setCurrentPoints([]);
+        } 
+        else if (mode === 'draw' && currentPoints.length >= 3) {
+          let area = 0; let realArea = null;
           for (let i = 0; i < currentPoints.length; i++) {
             const j = (i + 1) % currentPoints.length;
             area += currentPoints[i].x * currentPoints[j].y;
@@ -616,73 +491,42 @@
 
           if (mapMode === 'api') {
             const centerLat = (2 * Math.atan(Math.exp(viewport.center.y / R)) - Math.PI / 2) * 180 / Math.PI;
-            const correction = Math.cos(centerLat * Math.PI / 180);
-            realArea = area * correction * correction;
-          } else if (unitsPerMeter) {
-            realArea = area / (unitsPerMeter * unitsPerMeter);
-          }
+            realArea = area * Math.cos(centerLat * Math.PI / 180) * Math.cos(centerLat * Math.PI / 180);
+          } else if (unitsPerMeter) realArea = area / (unitsPerMeter * unitsPerMeter);
           
-          setPolygons([...polygons, { 
-            id: Date.now(), name: parcelName, points: currentPoints, 
-            fill: hexToRgba(activeColor, 0.5), border: activeColor, area: realArea, isOfficial: false
-          }]);
+          setPolygons([...polygons, { id: Date.now(), name: parcelName, points: currentPoints, border: activeColor, area: realArea, isOfficial: false }]);
           setCurrentPoints([]);
-          
-          const prefix = mapMode === 'api' ? 'Parcelle' : 'Surface';
-          setParcelName(`${prefix} ${String.fromCharCode(65 + polygons.length + 1)}`);
+          setParcelName(`${mapMode === 'api' ? 'Parcelle' : 'Surface'} ${String.fromCharCode(65 + polygons.length + 1)}`);
         }
       };
 
-      const deletePolygon = (id) => setPolygons(polygons.filter(p => p.id !== id));
-      
-      const handleRenameSubmit = (id, newName) => {
-        setPolygons(prev => prev.map(p => p.id === id ? { ...p, name: newName.trim() || p.name } : p));
-        setEditingPolygonId(null);
-      };
-      
-      const resetImage = () => {
-        setMapMode('none');
-        setLocalImage(null);
-        setPolygons([]);
-        setAddressQuery('');
-        setAddressResults([]);
-        setSearchError('');
-        setParcelName('Parcelle A');
-        tileCache.current = {};
+      // --- EXPORT / IMPORT PROJET ---
+      const exportProject = () => {
+        const data = { polygons, lines, viewport, mapMode, baseMap, addressQuery, parcelName };
+        const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'surfaces_io_projet.json'; a.click();
       };
 
-      const downloadImage = () => {
-        const link = document.createElement('a');
-        link.download = 'surfaces-io-export.png';
-        link.href = canvasRef.current.toDataURL('image/png');
-        link.click();
-      };
-
-      const downloadPDF = () => {
-        if (!canvasRef.current) return;
-        const dataUrl = canvasRef.current.toDataURL('image/png');
-        const printWindow = window.open('', '_blank');
-        if (printWindow) {
-          printWindow.document.write(`
-            <!DOCTYPE html>
-            <html>
-              <head>
-                <title>surfaces.io - Export PDF</title>
-                <style>
-                  @page { size: landscape; margin: 0; }
-                  body { margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #fff; }
-                  img { max-width: 100%; max-height: 100vh; object-fit: contain; }
-                </style>
-              </head>
-              <body>
-                <img src="${dataUrl}" onload="setTimeout(() => { window.print(); window.close(); }, 200);" />
-              </body>
-            </html>
-          `);
-          printWindow.document.close();
-        } else {
-          alert("Veuillez autoriser les pop-ups pour générer le document PDF.");
-        }
+      const importProject = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          try {
+            const data = JSON.parse(event.target.result);
+            if (data.polygons) setPolygons(data.polygons);
+            if (data.lines) setLines(data.lines);
+            if (data.viewport) setViewport(data.viewport);
+            if (data.mapMode) setMapMode(data.mapMode);
+            if (data.baseMap) setBaseMap(data.baseMap);
+            if (data.addressQuery) setAddressQuery(data.addressQuery);
+            if (data.parcelName) setParcelName(data.parcelName);
+            setMode('upload'); // Reset mode
+          } catch(err) { alert("Fichier de sauvegarde invalide ou corrompu."); }
+        };
+        reader.readAsText(file);
       };
 
       const theme = {
@@ -690,98 +534,63 @@
         sidebar: darkMode ? "bg-slate-800 border-slate-700" : "bg-white border-slate-200",
         topbar: darkMode ? "bg-slate-800 border-slate-700" : "bg-white border-slate-200",
         panel: darkMode ? "bg-slate-900/50 border-slate-700 shadow-none" : "bg-white border-slate-200 shadow-sm",
-        input: darkMode ? "bg-slate-950 border-slate-600 text-white placeholder-slate-500 focus:ring-indigo-500 focus:border-indigo-500" : "bg-white border-slate-300 text-slate-900 focus:ring-indigo-500 focus:border-indigo-500",
+        input: darkMode ? "bg-slate-950 border-slate-600 text-white placeholder-slate-500 focus:ring-indigo-500" : "bg-white border-slate-300 text-slate-900 focus:ring-indigo-500",
         textMain: darkMode ? "text-slate-300" : "text-slate-600",
         textMuted: darkMode ? "text-slate-400" : "text-slate-500",
         textTitle: darkMode ? "text-white" : "text-slate-900",
         border: darkMode ? "border-slate-700" : "border-slate-200",
         borderLight: darkMode ? "border-slate-700/50" : "border-slate-100",
         hoverBtn: darkMode ? "hover:bg-slate-700 text-slate-300" : "hover:bg-slate-50 text-slate-700",
-        emptyBox: darkMode ? "bg-slate-800/50 border-slate-600 hover:bg-slate-700 text-slate-300" : "bg-slate-50 border-slate-300 hover:bg-slate-100 text-slate-600",
-        canvasBg: darkMode ? "bg-[#0f172a]" : "bg-[#e2e8f0]",
         buttonSecondary: darkMode ? "bg-slate-800 border-slate-600 text-slate-200 hover:bg-slate-700" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
       };
 
       return (
         <div className={`flex h-screen font-sans overflow-hidden select-none transition-colors duration-200 ${theme.app}`}>
           
-          {/* Sidebar Gauche */}
+          {/* Sidebar */}
           <div className={`w-80 border-r flex flex-col z-20 transition-colors duration-200 ${theme.sidebar} shadow-sm`}>
-            
-            {/* Header / Logo */}
             <div className={`h-16 flex items-center justify-between px-6 border-b flex-shrink-0 ${theme.borderLight}`}>
               <div className="flex items-center gap-2">
                 <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center shadow-indigo-600/30 shadow-lg">
-                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"></path></svg>
+                  <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"></path></svg>
                 </div>
                 <span className={`text-xl font-bold tracking-tight ${theme.textTitle}`}>surfaces<span className="text-indigo-500">.io</span></span>
               </div>
-              <button 
-                onClick={() => setDarkMode(!darkMode)} 
-                className={`p-2 rounded-full transition-colors ${theme.hoverBtn}`}
-                title={darkMode ? "Passer en mode clair" : "Passer en mode sombre"}
-              >
-                {darkMode ? (
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
-                ) : (
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
-                )}
+              <button onClick={() => setDarkMode(!darkMode)} className={`p-2 rounded-full transition-colors ${theme.hoverBtn}`}>
+                {darkMode ? <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg> : <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>}
               </button>
             </div>
 
-            {/* Tools */}
             <div className="flex-1 overflow-y-auto p-6 space-y-8">
               
+              {/* 1. Localisation */}
               <section>
-                <h2 className={`text-xs font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>1. Localisation</h2>
+                <h2 className={`text-xs font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>1. Source du plan</h2>
                 {mapMode === 'none' ? (
                   <div className="space-y-4">
                     <div className="relative">
                       <svg className={`w-5 h-5 absolute left-3 top-2.5 ${theme.textMuted}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
-                      <input 
-                        type="text" 
-                        placeholder="Ex: 10 rue de la paix, Paris" 
-                        value={addressQuery}
-                        onChange={(e) => setAddressQuery(e.target.value)}
-                        className={`w-full pl-10 pr-10 py-2 text-sm border rounded-lg outline-none transition-colors shadow-sm ${theme.input}`}
-                      />
-                      {isSearching && (
-                        <div className="absolute right-3 top-2.5">
-                          <div className="w-4 h-4 border-2 border-transparent border-t-indigo-500 rounded-full animate-spin"></div>
-                        </div>
-                      )}
+                      <input type="text" placeholder="Ex: Nîmes" value={addressQuery} onChange={(e) => setAddressQuery(e.target.value)} className={`w-full pl-10 pr-10 py-2 text-sm border rounded-lg outline-none transition-colors shadow-sm ${theme.input}`} />
+                      {isSearching && <div className="absolute right-3 top-2.5"><div className="w-4 h-4 border-2 border-transparent border-t-indigo-500 rounded-full animate-spin"></div></div>}
                     </div>
-
-                    {searchError && (
-                      <div className={`text-xs p-3 rounded-lg border shadow-sm font-medium ${darkMode ? 'bg-red-900/30 text-red-400 border-red-800/50' : 'bg-red-50 text-red-700 border-red-200'}`}>
-                        {searchError}
-                      </div>
-                    )}
-
                     {addressResults.length > 0 && (
                       <div className={`border rounded-lg overflow-hidden flex flex-col ${theme.panel}`}>
-                        <div className={`px-3 py-2 border-b text-xs font-semibold uppercase tracking-wider ${theme.border} ${darkMode ? 'bg-slate-800/50' : 'bg-slate-50'} ${theme.textMuted}`}>Résultats</div>
-                        {addressResults.map((feat, idx) => (
-                          <button 
-                            key={feat.properties.id || idx}
-                            onClick={() => loadMapFromAddress(feat)}
-                            className={`w-full text-left px-3 py-3 text-sm border-b last:border-0 transition-colors ${theme.border} ${darkMode ? 'hover:bg-indigo-900/30' : 'hover:bg-indigo-50'}`}
-                          >
-                            <span className={`font-medium block ${theme.textTitle}`}>{feat.properties.name || feat.properties.label}</span>
-                            {feat.properties.context && <span className={`text-xs ${theme.textMuted}`}>{feat.properties.context}</span>}
-                          </button>
-                        ))}
+                        {addressResults.map((feat, idx) => {
+                          const p = feat.properties;
+                          const mainText = p.type === 'municipality' ? `${p.postcode || ''} ${p.name}`.trim() : `${p.name}, ${p.postcode || ''} ${p.city || ''}`.replace(/ ,/, ',').replace(/  +/g, ' ').trim();
+                          return (
+                            <button key={idx} onClick={() => loadMapFromAddress(feat)} className={`w-full text-left px-3 py-3 text-sm border-b last:border-0 transition-colors ${theme.border} ${darkMode ? 'hover:bg-indigo-900/30' : 'hover:bg-indigo-50'}`}>
+                              <span className={`font-medium block ${theme.textTitle}`}>{mainText}</span>
+                              {p.context && <span className={`text-xs ${theme.textMuted}`}>{p.context}</span>}
+                            </button>
+                          );
+                        })}
                       </div>
                     )}
-                    
                     <div className="flex items-center gap-2 pt-2">
-                      <div className={`flex-1 h-px ${theme.border}`}></div>
-                      <span className={`text-xs font-bold uppercase tracking-wider ${theme.textMuted}`}>ou</span>
-                      <div className={`flex-1 h-px ${theme.border}`}></div>
+                      <div className={`flex-1 h-px ${theme.border}`}></div><span className={`text-xs font-bold uppercase tracking-wider ${theme.textMuted}`}>ou</span><div className={`flex-1 h-px ${theme.border}`}></div>
                     </div>
-
-                    <label className={`flex flex-col items-center justify-center w-full h-20 border-2 border-dashed rounded-xl cursor-pointer group transition-colors ${theme.emptyBox}`}>
-                      <svg className={`w-6 h-6 mb-1 transition-colors ${darkMode ? 'text-slate-500 group-hover:text-indigo-400' : 'text-slate-400 group-hover:text-indigo-500'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                    <label className={`flex flex-col items-center justify-center w-full h-16 border-2 border-dashed rounded-xl cursor-pointer group transition-colors ${darkMode ? 'bg-slate-800/50 border-slate-600 hover:bg-slate-700 text-slate-300' : 'bg-slate-50 border-slate-300 hover:bg-slate-100 text-slate-600'}`}>
                       <span className={`text-xs font-medium transition-colors ${darkMode ? 'group-hover:text-indigo-400' : 'group-hover:text-indigo-600'}`}>Importer une image locale</span>
                       <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
                     </label>
@@ -789,190 +598,76 @@
                 ) : (
                   <div className={`flex items-center justify-between p-3 border rounded-lg ${theme.panel}`}>
                     <div className="flex flex-col">
-                      <span className={`text-sm font-medium flex items-center gap-2 ${theme.textTitle}`}>
-                        <svg className="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>
-                        Plan chargé
-                      </span>
-                      {mapMode === 'api' && <span className={`text-[10px] pl-6 ${theme.textMuted}`}>Moteur de tuiles actif</span>}
+                      <span className={`text-sm font-medium flex items-center gap-2 ${theme.textTitle}`}><svg className="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>Plan chargé</span>
                     </div>
-                    <button onClick={resetImage} className="text-xs text-red-500 hover:text-red-600 font-medium">Changer</button>
+                    <button onClick={() => { setMapMode('none'); setAddressResults([]); setAddressQuery(''); }} className="text-xs text-red-500 hover:text-red-600 font-medium">Changer</button>
                   </div>
                 )}
               </section>
 
+              {/* 2. Outils */}
               {mapMode !== 'none' && (
                 <section>
-                  <h2 className={`text-xs font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>2. Outils de parcelle</h2>
+                  <h2 className={`text-xs font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>2. Outils de dessin</h2>
                   <div className={`border rounded-xl p-4 space-y-4 ${theme.panel}`}>
+                    
+                    {/* Palette */}
                     <div>
-                      <div className="flex items-center justify-between mb-3">
-                        <label className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Couleur d'annotation</label>
-                      </div>
-                      <div className="flex items-center gap-3">
+                      <label className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted} mb-3 block`}>Couleur et Transparence</label>
+                      <div className="flex items-center gap-3 mb-3">
                         <div className="flex flex-wrap gap-2.5 flex-1">
                           {presetColors.map((c) => (
-                            <button
-                              key={c.hex}
-                              onClick={() => setActiveColor(c.hex)}
-                              className={`w-7 h-7 rounded-full shadow-sm transition-all flex items-center justify-center hover:scale-110 ${activeColor === c.hex ? `ring-2 ring-offset-2 ${darkMode ? 'ring-offset-slate-800 ring-indigo-400' : 'ring-offset-white ring-indigo-500'} z-10` : 'opacity-80 hover:opacity-100'}`}
-                              style={{ backgroundColor: c.hex }}
-                              title={c.label}
-                            >
-                              {activeColor === c.hex && (
-                                <div className="w-2.5 h-2.5 bg-white rounded-full shadow-sm"></div>
-                              )}
+                            <button key={c.hex} onClick={() => setActiveColor(c.hex)} className={`w-7 h-7 rounded-full shadow-sm transition-all flex items-center justify-center hover:scale-110 ${activeColor === c.hex ? `ring-2 ring-offset-2 ${darkMode ? 'ring-offset-slate-800 ring-indigo-400' : 'ring-offset-white ring-indigo-500'} z-10` : 'opacity-80 hover:opacity-100'}`} style={{ backgroundColor: c.hex }}>
+                              {activeColor === c.hex && <div className="w-2.5 h-2.5 bg-white rounded-full shadow-sm"></div>}
                             </button>
                           ))}
                         </div>
-
-                        <div className={`h-8 w-px ${theme.border}`}></div>
-
-                        <div className="relative group" title="Couleur personnalisée">
-                          <div className={`w-8 h-8 rounded-full shadow-sm border-2 ${darkMode ? 'border-slate-800' : 'border-white'} cursor-pointer overflow-hidden relative transition-all ${!presetColors.find(c => c.hex === activeColor) ? `ring-2 ring-offset-2 ${darkMode ? 'ring-offset-slate-800 ring-indigo-400' : 'ring-offset-white ring-indigo-500'} z-10` : 'hover:scale-110'}`}>
-                             <div className="absolute inset-0 bg-[conic-gradient(red,yellow,green,cyan,blue,magenta,red)]"></div>
-                             {!presetColors.find(c => c.hex === activeColor) && (
-                               <div className="absolute inset-0 m-auto w-3 h-3 bg-white rounded-full shadow-sm z-10 pointer-events-none"></div>
-                             )}
-                             <input
-                               type="color"
-                               value={activeColor}
-                               onChange={(e) => setActiveColor(e.target.value)}
-                               className="absolute inset-0 opacity-0 w-[200%] h-[200%] -top-1/2 -left-1/2 cursor-pointer z-20"
-                             />
-                          </div>
-                        </div>
                       </div>
+                      <input type="range" min="0" max="1" step="0.1" value={polygonOpacity} onChange={e => setPolygonOpacity(parseFloat(e.target.value))} className="w-full cursor-pointer" title={`Opacité: ${Math.round(polygonOpacity * 100)}%`} />
                     </div>
 
                     <hr className={theme.border} />
 
-                    {mapMode === 'api' ? (
-                      <div className="space-y-3">
-                        <div className="flex items-center justify-between">
-                          <label className={`text-xs font-medium px-2 py-1 rounded ${darkMode ? 'text-indigo-300 bg-indigo-900/40' : 'text-indigo-700 bg-indigo-50'}`}>✨ Baguette magique (API)</label>
-                        </div>
-                        <p className={`text-xs leading-relaxed ${theme.textMuted}`}>Cliquez sur une parcelle. L'API récupèrera ses limites et sa surface officielle.</p>
-                        <button 
-                          onClick={() => setMode('auto-select')}
-                          className={`w-full py-2.5 rounded-lg text-sm font-medium flex justify-center gap-2 items-center transition-colors ${mode === 'auto-select' ? 'bg-indigo-600 text-white shadow-md' : theme.buttonSecondary}`}
-                        >
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122"></path></svg>
-                          {mode === 'auto-select' ? 'Prêt à cliquer' : 'Activer la sélection auto'}
-                        </button>
-                        <div className="text-center"><span className={`text-xs ${theme.textMuted}`}>ou</span></div>
-                        <button 
-                          onClick={() => setMode('draw')}
-                          className={`w-full py-2.5 rounded-lg text-sm font-medium transition-colors ${mode === 'draw' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}
-                        >Tracer manuellement</button>
-                      </div>
-                    ) : (
-                      <div className="space-y-3">
-                        {!unitsPerMeter ? (
-                           <div className={`p-3 rounded-lg border space-y-2 ${darkMode ? 'bg-amber-900/20 border-amber-700/50' : 'bg-amber-50 border-amber-200'}`}>
-                             <span className={`text-xs font-bold uppercase ${darkMode ? 'text-amber-500' : 'text-amber-800'}`}>Étalonnage requis</span>
-                             <p className={`text-xs ${darkMode ? 'text-amber-400/80' : 'text-amber-700'}`}>Image locale : tracez une ligne connue pour le calcul des surfaces.</p>
-                             
-                             {mode !== 'calibrate' ? (
-                               <button onClick={() => { setMode('calibrate'); setCalibrationPoints([]); }} className={`w-full py-2 rounded-md text-xs font-medium border transition-colors ${darkMode ? 'bg-slate-800 border-amber-700/50 text-amber-400 hover:bg-amber-900/30' : 'bg-white border-amber-300 text-amber-700 hover:bg-amber-100'}`}>
-                                 Définir l'échelle
-                               </button>
-                             ) : (
-                               <div className="mt-2 space-y-2">
-                                 {calibrationPoints.length < 2 ? (
-                                   <div className={`text-xs font-medium animate-pulse p-2 rounded text-center ${darkMode ? 'bg-amber-900/40 text-amber-400' : 'bg-amber-100 text-amber-600'}`}>
-                                     {calibrationPoints.length === 0 ? "1. Cliquez sur le premier point" : "2. Cliquez sur le second point"}
-                                   </div>
-                                 ) : (
-                                   <div className={`space-y-2 p-2 rounded border ${darkMode ? 'bg-slate-800 border-amber-700/50' : 'bg-white border-amber-200'}`}>
-                                     <label className={`text-[10px] font-bold uppercase ${theme.textMuted}`}>Distance réelle</label>
-                                     <div className="flex gap-2">
-                                       <input 
-                                         type="number" 
-                                         value={knownDistance}
-                                         onChange={e => setKnownDistance(e.target.value)}
-                                         placeholder="Ex: 10"
-                                         className={`w-full p-1.5 text-sm border rounded outline-none transition-colors ${darkMode ? 'bg-slate-900 border-amber-700 text-white focus:border-amber-500' : 'bg-white border-amber-300 text-slate-900 focus:ring-amber-500'}`}
-                                       />
-                                       <select 
-                                         value={calibrationUnit} 
-                                         onChange={e => setCalibrationUnit(e.target.value)}
-                                         className={`p-1.5 text-sm border rounded outline-none cursor-pointer transition-colors ${darkMode ? 'bg-slate-900 border-amber-700 text-white focus:border-amber-500' : 'bg-white border-amber-300 text-slate-900 focus:ring-amber-500'}`}
-                                       >
-                                         <option value="mm">mm</option>
-                                         <option value="cm">cm</option>
-                                         <option value="m">mètres</option>
-                                         <option value="km">km</option>
-                                       </select>
-                                     </div>
-                                     <div className="flex gap-2 mt-2">
-                                       <button 
-                                         onClick={applyCalibration} 
-                                         disabled={!knownDistance}
-                                         className={`flex-1 py-1.5 rounded text-xs font-medium disabled:opacity-50 transition-colors ${darkMode ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-amber-500 hover:bg-amber-600 text-white'}`}
-                                       >
-                                         Valider
-                                       </button>
-                                       <button 
-                                         onClick={() => setCalibrationPoints([])}
-                                         className={`flex-1 py-1.5 rounded text-xs font-medium transition-colors ${darkMode ? 'bg-slate-700 hover:bg-slate-600 text-slate-200' : 'bg-slate-100 hover:bg-slate-200 text-slate-600'}`}
-                                       >
-                                         Reprendre
-                                       </button>
-                                     </div>
-                                   </div>
-                                 )}
-                               </div>
-                             )}
-                           </div>
-                        ) : (
-                          <button onClick={() => {setUnitsPerMeter(null); setMode('calibrate'); setCalibrationPoints([]);}} className={`text-xs hover:underline w-full text-left font-medium ${darkMode ? 'text-amber-400' : 'text-amber-600'}`}>
-                            📏 Modifier l'échelle définie
-                          </button>
-                        )}
-                        <button 
-                          onClick={() => setMode('draw')}
-                          disabled={!unitsPerMeter && mapMode === 'local'}
-                          className={`w-full py-2.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${mode === 'draw' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}
-                        >Tracer une parcelle</button>
-                      </div>
-                    )}
-                    
-                    {mode === 'draw' && (
+                    {/* Modes de dessin */}
+                    <div className="grid grid-cols-2 gap-2">
+                       {mapMode === 'api' && (
+                         <button onClick={() => setMode('auto-select')} className={`col-span-2 py-2 rounded-lg text-xs font-medium flex justify-center gap-2 items-center transition-colors ${mode === 'auto-select' ? 'bg-indigo-600 text-white shadow-md' : theme.buttonSecondary}`}>
+                           ✨ Baguette magique (Auto)
+                         </button>
+                       )}
+                       <button onClick={() => setMode('draw')} className={`col-span-1 py-2 rounded-lg text-xs font-medium transition-colors ${mode === 'draw' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}>
+                         ✏️ Tracer Surface
+                       </button>
+                       <button onClick={() => setMode('measure')} className={`col-span-1 py-2 rounded-lg text-xs font-medium transition-colors ${mode === 'measure' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}>
+                         📏 Mesurer Ligne
+                       </button>
+                    </div>
+
+                    {/* Actions en cours de dessin */}
+                    {(mode === 'draw' || mode === 'measure') && currentPoints.length > 0 && (
                       <div className={`pt-3 border-t mt-3 ${theme.borderLight}`}>
-                        <input 
-                          type="text" 
-                          value={parcelName}
-                          onChange={(e) => setParcelName(e.target.value)}
-                          placeholder="Nom de la parcelle"
-                          className={`w-full text-xs p-2 mb-2 border rounded outline-none transition-colors ${theme.input}`}
-                        />
-                        <button 
-                          onClick={completePolygon}
-                          disabled={currentPoints.length < 3}
-                          className="w-full py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 disabled:opacity-50 text-xs font-medium transition-colors"
-                        >
-                          Fermer le tracé ({currentPoints.length} points)
-                        </button>
+                        {mode === 'draw' && <input type="text" value={parcelName} onChange={(e) => setParcelName(e.target.value)} placeholder="Nom de la parcelle" className={`w-full text-xs p-2 mb-2 border rounded outline-none transition-colors ${theme.input}`} />}
+                        <div className="flex gap-2">
+                           <button onClick={() => setCurrentPoints(p => p.slice(0, -1))} className={`flex-1 py-2 border rounded-lg text-[10px] font-medium transition-colors ${theme.buttonSecondary}`}>
+                             ↩️ Annuler point
+                           </button>
+                           <button onClick={completePolygon} disabled={currentPoints.length < (mode==='draw'?3:2)} className="flex-1 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 disabled:opacity-50 text-[10px] font-medium transition-colors">
+                             ✅ Terminer
+                           </button>
+                        </div>
                       </div>
                     )}
                   </div>
                 </section>
               )}
 
-              {polygons.length > 0 && (
+              {/* 3. Calques */}
+              {(polygons.length > 0 || lines.length > 0) && (
                 <section>
                   <div className="flex items-center justify-between mb-3">
-                    <h2 className={`text-xs font-bold uppercase tracking-wider ${theme.textMuted}`}>3. Mesures & Calques</h2>
-                    <select 
-                      value={displayUnit} 
-                      onChange={e => setDisplayUnit(e.target.value)}
-                      className={`text-xs border rounded p-1 outline-none cursor-pointer transition-colors ${darkMode ? 'bg-slate-900 border-slate-600 text-slate-200 hover:border-indigo-500' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-300'}`}
-                    >
-                      <option value="mm²">mm²</option>
-                      <option value="cm²">cm²</option>
-                      <option value="m²">m²</option>
-                      <option value="ha">Hectares (ha)</option>
-                      <option value="km²">km²</option>
+                    <h2 className={`text-xs font-bold uppercase tracking-wider ${theme.textMuted}`}>3. Calques</h2>
+                    <select value={displayUnit} onChange={e => setDisplayUnit(e.target.value)} className={`text-xs border rounded p-1 outline-none cursor-pointer transition-colors ${darkMode ? 'bg-slate-900 border-slate-600 text-slate-200 hover:border-indigo-500' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-300'}`}>
+                      <option value="m²">m²</option><option value="ha">ha</option><option value="cm²">cm²</option>
                     </select>
                   </div>
                   <div className="space-y-2">
@@ -982,151 +677,120 @@
                           <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: poly.border }}></div>
                           <div className="min-w-0 flex-1">
                             {editingPolygonId === poly.id ? (
-                              <input
-                                autoFocus
-                                defaultValue={poly.name}
-                                onBlur={(e) => handleRenameSubmit(poly.id, e.target.value)}
-                                onKeyDown={(e) => e.key === 'Enter' && handleRenameSubmit(poly.id, e.target.value)}
-                                className={`w-full text-sm font-medium border-b bg-transparent outline-none ${theme.textTitle} border-indigo-500`}
-                              />
+                              <input autoFocus defaultValue={poly.name} onBlur={(e) => handleRenameSubmit(poly.id, e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleRenameSubmit(poly.id, e.target.value)} className={`w-full text-sm font-medium border-b bg-transparent outline-none ${theme.textTitle} border-indigo-500`} />
                             ) : (
-                              <p 
-                                className={`text-sm font-medium truncate cursor-pointer hover:text-indigo-500 transition-colors ${theme.textTitle}`}
-                                onClick={() => setEditingPolygonId(poly.id)}
-                                title="Cliquez pour renommer"
-                              >
-                                {poly.name}
-                              </p>
+                              <p className={`text-sm font-medium truncate cursor-pointer hover:text-indigo-500 transition-colors ${theme.textTitle}`} onClick={() => setEditingPolygonId(poly.id)}>{poly.name}</p>
                             )}
                             <div className="flex items-center gap-1">
                               {poly.area ? <p className={`text-xs font-semibold ${theme.textMain}`}>{formatArea(poly.area, displayUnit)}</p> : <p className={`text-xs ${theme.textMuted}`}>Non étalonné</p>}
-                              {poly.isOfficial && <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-bold ml-1 ${darkMode ? 'bg-emerald-900/40 text-emerald-400' : 'bg-green-100 text-green-700'}`}>OFFICIEL</span>}
                             </div>
                           </div>
                         </div>
-                        <button onClick={() => deletePolygon(poly.id)} className={`opacity-0 group-hover:opacity-100 transition-opacity p-1 flex-shrink-0 ${theme.textMuted} hover:text-red-500`}>
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                        </button>
+                        <button onClick={() => setPolygons(p => p.filter(x => x.id !== poly.id))} className={`opacity-0 group-hover:opacity-100 p-1 ${theme.textMuted} hover:text-red-500`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>
+                      </div>
+                    ))}
+                    {lines.map((line) => (
+                      <div key={line.id} className={`flex items-center justify-between p-3 border rounded-lg group transition-colors ${theme.panel}`}>
+                        <div className="flex items-center gap-3 flex-1 min-w-0">
+                          <div className="w-3 h-1 rounded-full flex-shrink-0" style={{ backgroundColor: line.color }}></div>
+                          <div className="min-w-0 flex-1">
+                            <p className={`text-sm font-medium truncate ${theme.textTitle}`}>Mesure Linéaire</p>
+                            <p className={`text-xs font-semibold ${theme.textMain}`}>{formatDistance(line.distance)}</p>
+                          </div>
+                        </div>
+                        <button onClick={() => setLines(l => l.filter(x => x.id !== line.id))} className={`opacity-0 group-hover:opacity-100 p-1 ${theme.textMuted} hover:text-red-500`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>
                       </div>
                     ))}
                   </div>
                 </section>
               )}
 
-            </div>
+              {/* Sauvegarde & Import */}
+              <section className="pt-6 border-t border-slate-200/50">
+                 <div className="flex gap-2">
+                   <button onClick={exportProject} className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-colors ${theme.buttonSecondary}`}>💾 Sauvegarder</button>
+                   <label className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-colors text-center cursor-pointer ${theme.buttonSecondary}`}>
+                     📂 Ouvrir
+                     <input type="file" accept=".json" className="hidden" onChange={importProject} />
+                   </label>
+                 </div>
+              </section>
 
-            {mapMode !== 'none' && (
-              <div className={`p-4 border-t flex gap-3 ${theme.sidebar} ${theme.borderLight}`}>
-                <button 
-                  onClick={downloadImage}
-                  className={`flex-1 py-3 text-white rounded-xl text-xs font-medium transition-all flex items-center justify-center gap-2 shadow-lg active:scale-[0.98] ${darkMode ? 'bg-slate-700 hover:bg-slate-600 shadow-slate-900/50' : 'bg-slate-900 hover:bg-slate-800 shadow-slate-900/20'}`}
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                  Image PNG
-                </button>
-                <button 
-                  onClick={downloadPDF}
-                  className={`flex-1 py-3 text-white rounded-xl text-xs font-medium transition-all flex items-center justify-center gap-2 shadow-lg active:scale-[0.98] ${darkMode ? 'bg-indigo-500 hover:bg-indigo-400 shadow-indigo-900/50' : 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-600/20'}`}
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg>
-                  Doc PDF
-                </button>
-              </div>
-            )}
+            </div>
           </div>
 
-          {/* Zone principale (Canvas Cartographique) */}
+          {/* Zone principale (Carte) */}
           <div className={`flex-1 flex flex-col relative z-10 transition-colors duration-200 ${theme.canvasBg}`}>
             
             {isLoading && (
               <div className={`absolute inset-0 z-50 backdrop-blur-sm flex flex-col items-center justify-center ${darkMode ? 'bg-slate-900/80 text-indigo-300' : 'bg-white/80 text-indigo-900'}`}>
                  <div className={`w-12 h-12 border-4 rounded-full animate-spin mb-4 ${darkMode ? 'border-indigo-900 border-t-indigo-400' : 'border-indigo-200 border-t-indigo-600'}`}></div>
-                 <p className="font-medium">Récupération des frontières...</p>
+                 <p className="font-medium">Chargement...</p>
               </div>
             )}
-
-            {/* Topbar info */}
-            <div className={`h-16 flex items-center justify-between px-6 border-b z-20 shadow-sm transition-colors duration-200 ${theme.topbar}`}>
-              <div className="flex items-center gap-4">
-                <h1 className={`text-lg font-medium ${theme.textTitle}`}>Visionneuse Interactive</h1>
-                {mode === 'auto-select' && <span className={`px-3 py-1 text-xs font-bold rounded-full animate-pulse border ${darkMode ? 'bg-indigo-900/40 text-indigo-300 border-indigo-800' : 'bg-indigo-100 text-indigo-800 border-indigo-200'}`}>✨ Mode Auto-Sélection</span>}
-                {mode === 'calibrate' && <span className={`px-3 py-1 text-xs font-bold rounded-full border ${darkMode ? 'bg-amber-900/40 text-amber-400 border-amber-800' : 'bg-amber-100 text-amber-800 border-amber-200'}`}>📏 Étalonnage</span>}
-                {mode === 'draw' && <span className={`px-3 py-1 text-xs font-bold rounded-full border ${darkMode ? 'bg-slate-800 text-slate-300 border-slate-600' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>✏️ Tracé en cours</span>}
-              </div>
-              <div className="flex items-center gap-4">
-                <div className={`text-sm font-medium flex items-center gap-2 ${theme.textMuted}`}>
-                   {mapMode === 'api' && <span className={`flex items-center gap-1 px-2 py-1 rounded ${darkMode ? 'text-emerald-400 bg-emerald-900/30' : 'text-emerald-600 bg-emerald-50'}`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> Connexion WMTS Haute Vitesse</span>}
-                   {mapMode === 'local' && unitsPerMeter && <span>Échelle locale définie</span>}
-                </div>
-              </div>
-            </div>
 
             {/* Moteur Slippy Map */}
             <div 
               ref={containerRef}
               className={`flex-1 relative overflow-hidden transition-colors duration-200 ${theme.canvasBg} ${mapMode === 'none' ? '' : (isDragging ? 'cursor-grabbing' : (mode === 'upload' ? 'cursor-grab' : 'cursor-crosshair'))}`}
-              onMouseDown={handleMouseDown}
-              onMouseMove={handleMouseMove}
-              onMouseUp={handleMouseUp}
-              onMouseLeave={handleMouseUp}
+              onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
             >
               {mapMode === 'none' ? (
                 <div className={`absolute inset-0 flex flex-col items-center justify-center max-w-md mx-auto text-center pointer-events-none ${theme.textMuted}`}>
                   <div className={`w-20 h-20 rounded-full flex items-center justify-center mb-6 shadow-inner ${darkMode ? 'bg-indigo-900/20 text-indigo-500' : 'bg-indigo-50 text-indigo-300'}`}>
                     <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
                   </div>
-                  <p className={`text-xl font-semibold mb-2 ${theme.textTitle}`}>Prêt à mapper.</p>
-                  <p>Recherchez une adresse dans la barre latérale ou importez une image pour commencer.</p>
+                  <p className={`text-xl font-semibold mb-2 ${theme.textTitle}`}>Bienvenue sur surfaces.io</p>
+                  <p>Recherchez une adresse ou importez un plan local pour commencer à tracer.</p>
                 </div>
               ) : (
                 <>
-                  <canvas 
-                    ref={canvasRef}
-                    className="absolute inset-0 w-full h-full pointer-events-none"
-                  />
+                  <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
                   
+                  {/* Tableau récapitulatif flottant */}
                   {Object.keys(areaSummaryByColor).length > 0 && (
-                    <div 
-                      className={`absolute top-4 right-4 z-30 p-4 rounded-xl shadow-lg border backdrop-blur-md min-w-[220px] transition-colors duration-200 cursor-default ${darkMode ? 'bg-slate-900/80 border-slate-700' : 'bg-white/90 border-slate-200'}`}
-                      onMouseDown={e => e.stopPropagation()}
-                      onMouseMove={e => e.stopPropagation()}
-                      onMouseUp={e => e.stopPropagation()}
-                      onWheel={e => e.stopPropagation()}
-                    >
+                    <div className={`absolute top-4 right-4 z-30 p-4 rounded-xl shadow-lg border backdrop-blur-md min-w-[220px] cursor-default ${darkMode ? 'bg-slate-900/80 border-slate-700' : 'bg-white/90 border-slate-200'}`} onMouseDown={e=>e.stopPropagation()} onMouseMove={e=>e.stopPropagation()} onWheel={e=>e.stopPropagation()}>
                       <h3 className={`text-[10px] font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>Récapitulatif</h3>
                       <div className="space-y-2.5">
                         {Object.entries(areaSummaryByColor).map(([color, totalArea]) => (
                           <div key={color} className="flex items-center justify-between gap-6">
                             <div className="flex items-center gap-2">
                               <div className="w-3 h-3 rounded-full shadow-sm" style={{ backgroundColor: color }}></div>
-                              <span className={`text-sm font-medium ${theme.textTitle}`}>
-                                {presetColors.find(c => c.hex === color)?.label || 'Personnalisée'}
-                              </span>
                             </div>
-                            <span className={`text-sm font-bold ${theme.textMain}`}>
-                              {formatArea(totalArea, displayUnit)}
-                            </span>
+                            <span className={`text-sm font-bold ${theme.textMain}`}>{formatArea(totalArea, displayUnit)}</span>
                           </div>
                         ))}
                       </div>
                       <div className={`mt-3 pt-3 border-t flex justify-between items-center ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
                         <span className={`text-xs font-bold uppercase ${theme.textMuted}`}>Total Global</span>
-                        <span className={`text-sm font-black ${darkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>
-                          {formatArea(Object.values(areaSummaryByColor).reduce((a, b) => a + b, 0), displayUnit)}
-                        </span>
+                        <span className={`text-sm font-black ${darkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>{formatArea(Object.values(areaSummaryByColor).reduce((a, b) => a + b, 0), displayUnit)}</span>
                       </div>
                     </div>
                   )}
+
+                  {/* Contrôles Flottants Carte */}
+                  <div className="absolute bottom-6 right-6 flex flex-col gap-3 z-30 pointer-events-auto" onMouseDown={e=>e.stopPropagation()} onMouseMove={e=>e.stopPropagation()} onWheel={e=>e.stopPropagation()}>
+                     
+                     {mapMode === 'api' && (
+                        <div className={`flex flex-col bg-white rounded-lg shadow-lg border overflow-hidden ${darkMode ? 'bg-slate-800 border-slate-600' : 'bg-white border-slate-200'}`}>
+                           <button onClick={() => setBaseMap('ortho')} className={`px-3 py-2 text-[10px] font-bold uppercase ${baseMap === 'ortho' ? 'bg-indigo-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Satellite</button>
+                           <button onClick={() => setBaseMap('plan')} className={`px-3 py-2 text-[10px] font-bold uppercase border-y ${darkMode ? 'border-slate-700' : 'border-slate-100'} ${baseMap === 'plan' ? 'bg-indigo-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Plan IGN</button>
+                           <button onClick={() => setBaseMap('cadastre')} className={`px-3 py-2 text-[10px] font-bold uppercase ${baseMap === 'cadastre' ? 'bg-indigo-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Lignes</button>
+                        </div>
+                     )}
+
+                     <button onClick={handleGeolocate} className={`p-3 rounded-full shadow-lg border flex items-center justify-center transition-transform hover:scale-105 ${darkMode ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-white border-slate-200 text-indigo-600'}`} title="Me localiser">
+                       <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                     </button>
+                  </div>
                 </>
               )}
             </div>
           </div>
-
         </div>
       );
     }
 
-    // Démarrage de React
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(<App />);
   </script>
