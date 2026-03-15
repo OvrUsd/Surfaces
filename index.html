@@ -1,0 +1,1576 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>surfaces.io - Éditeur Cadastral</title>
+  
+  <script>const _cw=console.warn;console.warn=function(){if(arguments[0]&&typeof arguments[0]==='string'&&arguments[0].includes('cdn.tailwindcss.com'))return;_cw.apply(console,arguments)}</script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  
+  <style>
+    body, html { margin: 0; padding: 0; overflow: hidden; background-color: #f8fafc; }
+    input[type=range] { accent-color: #2A9D8F; }
+    .custom-scrollbar::-webkit-scrollbar { width: 8px; }
+    .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; min-height: 40px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #64748b; }
+    .dark .custom-scrollbar::-webkit-scrollbar-thumb { background: #475569; }
+    .dark .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #64748b; }
+    details > summary { list-style: none; }
+    details > summary::-webkit-details-marker { display: none; }
+    input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=number] { -moz-appearance: textfield; }
+    @media (max-width: 768px) {
+      .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+    }
+    .toast-in { animation: toastIn .3s ease-out forwards; }
+    .toast-out { animation: toastOut .3s ease-in forwards; }
+    @keyframes toastIn { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes toastOut { from{opacity:1;transform:translateY(0)} to{opacity:0;transform:translateY(16px)} }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useMemo, useCallback } = React;
+
+    const R = 6378137;
+    const ORIGIN_SHIFT = 2 * Math.PI * R / 2.0;
+    const INITIAL_RESOLUTION = 2 * Math.PI * R / 256.0;
+    const TILE_CACHE_MAX = 512;
+
+    let _idCounter = 0;
+    const uid = () => `id_${Date.now()}_${++_idCounter}`;
+
+    const pxToGeo = (px, py, vp) => ({
+      x: vp.center.x + (px - vp.width / 2) * vp.resolution,
+      y: vp.center.y - (py - vp.height / 2) * vp.resolution
+    });
+    const geoToPx = (gx, gy, vp) => ({
+      x: vp.width / 2 + (gx - vp.center.x) / vp.resolution,
+      y: vp.height / 2 - (gy - vp.center.y) / vp.resolution
+    });
+
+    const getTileAtGeo = (gx, gy, z) => {
+      const res = INITIAL_RESOLUTION / Math.pow(2, z);
+      const px = (gx + ORIGIN_SHIFT) / res;
+      const py = (ORIGIN_SHIFT - gy) / res;
+      return { tx: Math.floor(px / 256), ty: Math.floor(py / 256) };
+    };
+    const getGeoAtTile = (tx, ty, z) => {
+      const res = INITIAL_RESOLUTION / Math.pow(2, z);
+      const px = tx * 256;
+      const py = ty * 256;
+      return { gx: px * res - ORIGIN_SHIFT, gy: ORIGIN_SHIFT - py * res };
+    };
+
+    const hexToRgba = (hex, alpha) => {
+      const cleanHex = hex.replace('#', '');
+      const r = parseInt(cleanHex.substring(0, 2), 16);
+      const g = parseInt(cleanHex.substring(2, 4), 16);
+      const b = parseInt(cleanHex.substring(4, 6), 16);
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    };
+
+    // Helper très robuste pour éviter les crashs API sur anciens téléphones
+    const safeFetch = (url) => fetch(url).then(r => r.ok ? r.json() : null).catch(() => null);
+
+    window.dvfCache = window.dvfCache || {};
+
+    function Toast({ message, type, onDone }) {
+      const [exiting, setExiting] = useState(false);
+      useEffect(() => { const t = setTimeout(() => setExiting(true), 3500); return () => clearTimeout(t); }, []);
+      useEffect(() => { if (exiting) { const t = setTimeout(onDone, 300); return () => clearTimeout(t); } }, [exiting]);
+      const bg = type === 'error' ? 'bg-red-600' : type === 'success' ? 'bg-emerald-600' : 'bg-slate-800';
+      return (
+        <div className={`${exiting ? 'toast-out' : 'toast-in'} fixed bottom-6 left-1/2 -translate-x-1/2 z-[9999] px-5 py-3 rounded-xl text-white text-sm font-medium shadow-2xl pointer-events-none ${bg}`}>
+          {message}
+        </div>
+      );
+    }
+
+    function App() {
+      const [viewport, setViewport] = useState({ center: { x: 0, y: 0 }, resolution: 0.5, width: 800, height: 600 });
+      const [mapMode, setMapMode] = useState('none'); 
+      const [renderTrigger, setRenderTrigger] = useState(0); 
+      const [darkMode, setDarkMode] = useState(false);
+      
+      const [polygons, setPolygons] = useState([]);
+      const [lines, setLines] = useState([]); 
+      const [currentPoints, setCurrentPoints] = useState([]);
+      const [dvfLinks, setDvfLinks] = useState([]); 
+      const [mode, setMode] = useState('upload'); 
+      const [isLoading, setIsLoading] = useState(false);
+      const [baseMap, setBaseMap] = useState('ortho');
+      const [sidebarOpen, setSidebarOpen] = useState(false); 
+      
+      const [activeParcelData, setActiveParcelData] = useState(null);
+      const [activePanelTab, setActivePanelTab] = useState('diag'); 
+      
+      const [isDragging, setIsDragging] = useState(false);
+      const dragStartRef = useRef({ x: 0, y: 0 });
+      const dragMovedRef = useRef(false);
+      const lastTouchRef = useRef(null);
+      
+      const containerRef = useRef(null);
+      const canvasRef = useRef(null);
+      const tileCache = useRef({}); 
+      const tileCacheKeys = useRef([]);
+      
+      const [toast, setToast] = useState(null);
+      const showToast = useCallback((message, type = 'info') => {
+        setToast({ message, type, key: uid() });
+      }, []); 
+      
+      const [addressQuery, setAddressQuery] = useState('');
+      const [addressResults, setAddressResults] = useState([]);
+      const [searchHistory, setSearchHistory] = useState([]);
+      const [isSearching, setIsSearching] = useState(false);
+      const [searchError, setSearchError] = useState('');
+      
+      const [localImage, setLocalImage] = useState(null);
+      const [calibrationPoints, setCalibrationPoints] = useState([]);
+      const [knownDistance, setKnownDistance] = useState('');
+      const [unitsPerMeter, setUnitsPerMeter] = useState(null);
+      const [calibrationUnit, setCalibrationUnit] = useState('m');
+      const [displayUnit, setDisplayUnit] = useState('m²');
+      const [dvfRadius, setDvfRadius] = useState(500); 
+      
+      const presetColors = [
+        { label: 'Océan', hex: '#264653' }, { label: 'Émeraude', hex: '#2A9D8F' },
+        { label: 'Sable', hex: '#E9C46A' }, { label: 'Safran', hex: '#F4A261' },
+        { label: 'Terre cuite', hex: '#E76F51' }, { label: 'Rouge', hex: '#ef4444' },
+        { label: 'Rose', hex: '#ec4899' }, { label: 'Violet', hex: '#a855f7' },
+        { label: 'Bleu', hex: '#3b82f6' }, { label: 'Cyan', hex: '#06b6d4' },
+        { label: 'Vert', hex: '#22c55e' }, { label: 'Jaune', hex: '#eab308' },
+      ];
+      
+      const [activeColor, setActiveColor] = useState(presetColors[1].hex);
+      const [parcelName, setParcelName] = useState('Parcelle A');
+      const [editingPolygonId, setEditingPolygonId] = useState(null);
+      const [polygonOpacity, setPolygonOpacity] = useState(0.5); 
+
+      const formatArea = (sqMeters, unit) => {
+        if (sqMeters === null || sqMeters === undefined) return '';
+        switch (unit) {
+          case 'mm²': return (sqMeters * 1000000).toLocaleString('fr-FR', { maximumFractionDigits: 0 }) + ' mm²';
+          case 'cm²': return (sqMeters * 10000).toLocaleString('fr-FR', { maximumFractionDigits: 1 }) + ' cm²';
+          case 'm²': return sqMeters.toLocaleString('fr-FR', { maximumFractionDigits: 2 }) + ' m²';
+          case 'ha': return (sqMeters / 10000).toLocaleString('fr-FR', { maximumFractionDigits: 4 }) + ' ha';
+          case 'km²': return (sqMeters / 1000000).toLocaleString('fr-FR', { maximumFractionDigits: 4 }) + ' km²';
+          default: return sqMeters.toLocaleString('fr-FR', { maximumFractionDigits: 2 }) + ' m²';
+        }
+      };
+
+      const formatDistance = (meters) => {
+        if (meters < 1000) return `${meters.toLocaleString('fr-FR', { maximumFractionDigits: 2 })} m`;
+        return `${(meters/1000).toLocaleString('fr-FR', { maximumFractionDigits: 2 })} km`;
+      };
+      
+      const areaSummaryByColor = useMemo(() => {
+        const summary = {};
+        polygons.forEach(poly => {
+          if (poly.area !== null && poly.area !== undefined) {
+            if (!summary[poly.border]) summary[poly.border] = 0;
+            summary[poly.border] += poly.area;
+          }
+        });
+        return summary;
+      }, [polygons]);
+
+      useEffect(() => {
+        const updateSize = () => {
+           if (containerRef.current) {
+             setViewport(v => ({ ...v, width: containerRef.current.clientWidth, height: containerRef.current.clientHeight }));
+           }
+        };
+        if (typeof ResizeObserver !== 'undefined' && containerRef.current) {
+          const observer = new ResizeObserver(updateSize);
+          observer.observe(containerRef.current);
+          return () => observer.disconnect();
+        } else {
+          window.addEventListener('resize', updateSize);
+          updateSize();
+          return () => window.removeEventListener('resize', updateSize);
+        }
+      }, []);
+
+      useEffect(() => {
+        const query = addressQuery.trim();
+        if (query.length < 3) { setAddressResults([]); setSearchError(''); setIsSearching(false); return; }
+        setIsSearching(true);
+        const controller = new AbortController();
+        const timer = setTimeout(async () => {
+          try {
+            let url = `https://api-adresse.data.gouv.fr/search/?q=${encodeURIComponent(query)}&limit=7&autocomplete=1`;
+            if (mapMode === 'api' && viewport.center.x !== 0) {
+              const lonBias = (viewport.center.x / R) * 180 / Math.PI;
+              const latBias = (2 * Math.atan(Math.exp(viewport.center.y / R)) - Math.PI / 2) * 180 / Math.PI;
+              url += `&lat=${latBias.toFixed(5)}&lon=${lonBias.toFixed(5)}`;
+            }
+            const res = await fetch(url, { signal: controller.signal });
+            if (!res.ok) throw new Error();
+            const data = await res.json();
+            if (data?.features?.length > 0) {
+              const seen = new Set();
+              const unique = data.features.filter(f => {
+                const key = f.properties.label;
+                if (seen.has(key)) return false;
+                seen.add(key); return true;
+              });
+              setAddressResults(unique); setSearchError('');
+            } else {
+              setAddressResults([]); setSearchError('Aucune adresse trouvée.');
+            }
+          } catch (err) {
+            if (err.name !== 'AbortError') setSearchError('Erreur serveur.');
+          } finally { setIsSearching(false); }
+        }, 300);
+        return () => { clearTimeout(timer); controller.abort(); };
+      }, [addressQuery]);
+
+      const loadMapFromAddress = (feature) => {
+        const label = feature.properties.label;
+        setSearchHistory(prev => [{ label, feature }, ...prev.filter(h => h.label !== label)].slice(0, 5));
+        setAddressResults([]);
+        setAddressQuery(feature.properties.label);
+        const lon = feature.geometry.coordinates[0];
+        const lat = feature.geometry.coordinates[1];
+        const x = (lon * Math.PI / 180) * R;
+        const y = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) * R;
+        
+        // Sauvegarder le contexte local si on vient du mode image
+        if (mapMode === 'local') {
+          // Un changement de mapMode réinitialisera les calques, on les stockera plus tard si on implémente un full switch
+        }
+        
+        setViewport(v => ({ ...v, center: { x, y }, resolution: 0.5 })); 
+        setLocalImage(null); setMapMode('api'); setMode('auto-select'); setParcelName('Parcelle A');
+        setActiveParcelData(null);
+        setActivePanelTab('diag');
+      };
+
+      const fetchParcelFromClick = async (lon, lat) => {
+        setIsLoading(true);
+        try {
+          const geomQuery = JSON.stringify({ type: "Point", coordinates: [lon, lat] });
+          const res = await fetch(`https://apicarto.ign.fr/api/cadastre/parcelle?geom=${encodeURIComponent(geomQuery)}`);
+          if (!res.ok) throw new Error();
+          const data = await res.json();
+          
+          if (data.features && data.features.length > 0) {
+            const parcel = data.features[0];
+            const num = parcel.properties.numero;
+            const section = parcel.properties.section;
+            const codeCommune = parcel.properties.code_com || parcel.properties.commune || "";
+            const prefix = parcel.properties.prefixe || parcel.properties.com_abs || "000";
+            const parcelId = parcel.properties.idu || parcel.id || (codeCommune + prefix + (section || "").padStart(2, '0') + (num || "").padStart(4, '0'));
+            const sectionPrefixee = prefix + (section || "").padStart(2, '0'); 
+            
+            let rings = parcel.geometry.type === 'Polygon' ? [parcel.geometry.coordinates[0]] : parcel.geometry.coordinates.map(p => p[0]);
+            const geoPoints = rings[0].map(coord => ({
+              x: (coord[0] * Math.PI / 180) * R, y: Math.log(Math.tan(Math.PI / 4 + (coord[1] * Math.PI / 180) / 2)) * R
+            }));
+            
+            // Vérifier si cette parcelle existe déjà
+            const existingPoly = polygons.find(p => p.isOfficial && p.name === `Parcelle ${num}` && p.parcelData?.section === section);
+            if (existingPoly && existingPoly.parcelData) {
+              setActiveParcelData(existingPoly.parcelData);
+              setActivePanelTab('diag');
+              setIsLoading(false);
+              return;
+            }
+            
+            setPolygons(prev => [...prev.filter(p => !p.isDvfHighlight), { 
+              id: uid(), name: `Parcelle ${num}`, points: geoPoints, border: activeColor, area: parcel.properties.contenance, isOfficial: true
+            }]);
+            setDvfLinks([]);
+
+            setActiveParcelData({ num, section, isLoading: true });
+            setActivePanelTab('diag');
+
+            try {
+               const dataGeo = await safeFetch(`https://api-adresse.data.gouv.fr/reverse/?lon=${lon}&lat=${lat}`);
+               let citycode = ''; let cityname = '';
+               if(dataGeo?.features?.length > 0) {
+                   citycode = dataGeo.features[0].properties.citycode;
+                   cityname = dataGeo.features[0].properties.city;
+               }
+               
+               let zoning = null;
+               let reglementUrl = null;
+               const geomPoint = encodeURIComponent(JSON.stringify({type:"Point",coordinates:[lon,lat]}));
+               
+               const [dataGpu, dataRad, dataGaspar, dataCav, dataMvt, dataPpr, dataCatnat, dataPres, dataSup, dataCommune] = await Promise.all([
+                   safeFetch(`https://apicarto.ign.fr/api/gpu/zone-urba?geom=${geomPoint}`),
+                   safeFetch(`https://www.georisques.gouv.fr/api/v1/radon?code_insee=${citycode}`),
+                   safeFetch(`https://www.georisques.gouv.fr/api/v1/gaspar/risques?code_insee=${citycode}`),
+                   safeFetch(`https://www.georisques.gouv.fr/api/v1/cavites?code_insee=${citycode}&page=1&page_size=10`),
+                   safeFetch(`https://www.georisques.gouv.fr/api/v1/mvt?code_insee=${citycode}&page=1&page_size=10`),
+                   safeFetch(`https://www.georisques.gouv.fr/api/v1/ppr?code_insee=${citycode}&page=1&page_size=50`),
+                   safeFetch(`https://www.georisques.gouv.fr/api/v1/gaspar/catnat?code_insee=${citycode}&page=1&page_size=100`),
+                   safeFetch(`https://apicarto.ign.fr/api/gpu/prescription-surf?geom=${geomPoint}`),
+                   safeFetch(`https://apicarto.ign.fr/api/gpu/assiette-sup-s?geom=${geomPoint}`),
+                   safeFetch(`https://geo.api.gouv.fr/communes/${citycode}?fields=nom,population,surface,codesPostaux,departement,region`)
+               ]);
+
+               if (dataGpu?.features?.length > 0) {
+                   const zoneProps = dataGpu.features[0].properties;
+                   const types = { 'U': 'Urbaine', 'AU': 'À urbaniser', 'A': 'Agricole', 'N': 'Naturelle' };
+                   const typeLibelle = types[zoneProps.typezone] || 'PLU';
+                   zoning = `Zone ${typeLibelle} ${zoneProps.libelle ? '('+zoneProps.libelle+')' : ''}`.trim();
+                   if (zoneProps.partition) {
+                       reglementUrl = `https://www.geoportail-urbanisme.gouv.fr/map/#tile=1&lon=${lon}&lat=${lat}&zoom=18`;
+                   }
+               }
+
+               let finalRisks = [];
+               const baseQueryParams = `form-adresse=true&isCadastre=false&city=${encodeURIComponent(cityname)}&type=coord&typeForm=adresse&codeInsee=${citycode}&lon=${lon}&lat=${lat}&go_back=%2F&propertiesType=coord&adresse=${encodeURIComponent(cityname)}`;
+               const parcelReportUrl = `https://www.georisques.gouv.fr/mes-risques/connaitre-les-risques-pres-de-chez-moi/rapport2?${baseQueryParams}`;
+
+               if (dataRad?.data?.length > 0) {
+                   const cat = String(dataRad.data[0].classe_potentiel || "");
+                   let color = 'yellow', sev = `Potentiel Moyen (catégorie ${cat})`;
+                   if (cat === '3') { color = 'red'; sev = 'Potentiel Élevé (catégorie 3)'; }
+                   else if (cat === '1') { color = 'green'; sev = 'Potentiel Faible (catégorie 1)'; }
+                   finalRisks.push({ name: "Potentiel Radon", scope: "Commune", colorCode: color, severity: sev });
+               }
+
+               if (dataGaspar?.data) {
+                   const seenRisks = new Set();
+                   let sismiciteAdded = false;
+
+                   dataGaspar.data.forEach(item => {
+                       if (!sismiciteAdded && item.risques_detail) {
+                           item.risques_detail.forEach(detail => {
+                               if (detail.zone_sismicite && !sismiciteAdded) {
+                                   sismiciteAdded = true;
+                                   const z = String(detail.zone_sismicite);
+                                   let color = 'yellow', sev = `Zone ${z} — Modéré`;
+                                   if (z === '1') { color = 'green'; sev = 'Zone 1 — Très faible'; }
+                                   else if (z === '2') { color = 'green'; sev = 'Zone 2 — Faible'; }
+                                   else if (z === '4') { color = 'red'; sev = 'Zone 4 — Moyen'; }
+                                   else if (z === '5') { color = 'red'; sev = 'Zone 5 — Fort'; }
+                                   finalRisks.push({ name: "Séisme", scope: "Commune", colorCode: color, severity: sev });
+                               }
+                           });
+                       }
+
+                       if (item.risques_detail && Array.isArray(item.risques_detail)) {
+                           item.risques_detail.forEach(detail => {
+                               const riskName = detail.libelle_risque_long || '';
+                               if (!riskName || seenRisks.has(riskName.toLowerCase())) return;
+                               if (riskName.toLowerCase().includes('séisme') || riskName.toLowerCase().includes('seisme')) return;
+                               seenRisks.add(riskName.toLowerCase());
+                               
+                               const sev = detail.etat_zone_risque || detail.etat_bassin_risque || "Existant";
+                               let color = 'yellow';
+                               const sLow = sev.toLowerCase();
+                               if (sLow.includes('fort') || sLow.includes('élevé') || sLow.includes('majeur') || sLow.includes('important')) color = 'red';
+                               else if (sLow.includes('faible') || sLow.includes('nul') || sLow.includes('pas de risque') || sLow.includes('abrogé')) color = 'green';
+                               else if (sLow.includes('existant') || sLow.includes('concern') || sLow.includes('reconnu')) color = 'yellow';
+                               
+                               if (riskName.toLowerCase().includes('rupture') || riskName.toLowerCase().includes('seveso') || riskName.toLowerCase().includes('nucléaire')) color = 'red';
+                               
+                               finalRisks.push({ name: riskName, scope: "Commune", colorCode: color, severity: sev });
+                           });
+                       }
+                       
+                       if (item.libelle_risque_long && (!item.risques_detail || item.risques_detail.length === 0)) {
+                           const riskName = item.libelle_risque_long;
+                           if (!seenRisks.has(riskName.toLowerCase())) {
+                               seenRisks.add(riskName.toLowerCase());
+                               const sev = item.etat_arrete || item.etat_risque || "Existant";
+                               finalRisks.push({ name: riskName, scope: "Commune", colorCode: 'yellow', severity: sev });
+                           }
+                       }
+                   });
+               }
+
+               if (dataPpr?.data?.length > 0) {
+                   const pprTypes = new Map();
+                   dataPpr.data.forEach(ppr => {
+                       const etat = ppr.etat?.libelle_etat || '';
+                       const isActive = etat.toLowerCase().includes('approuv') || etat.toLowerCase().includes('prescri');
+                       if (!isActive) return;
+                       
+                       const risques = ppr.risques || [];
+                       risques.forEach(r => {
+                           const name = r.libelle_risque_long || r.libelle_risque || '';
+                           if (name && !pprTypes.has(name)) {
+                               pprTypes.set(name, { pprName: ppr.nom_ppr || '', etat: etat });
+                           }
+                       });
+                   });
+                   
+                   if (pprTypes.size > 0) {
+                       pprTypes.forEach(({ pprName, etat }, riskName) => {
+                           const rnLow = riskName.toLowerCase();
+                           const alreadyExists = finalRisks.some(r => r.name.toLowerCase() === rnLow);
+                           if (!alreadyExists) {
+                               finalRisks.push({ name: riskName, scope: "PPR", colorCode: 'red', severity: `PPR ${etat}` });
+                           }
+                       });
+                   }
+               }
+
+               const totalCav = dataCav?.results || dataCav?.data?.length || 0;
+               if (totalCav > 0) {
+                   finalRisks.push({ name: "Cavités souterraines", scope: "Commune", colorCode: 'yellow', severity: `${totalCav} cavité(s) répertoriée(s)` });
+               }
+
+               const totalMvt = dataMvt?.results || dataMvt?.data?.length || 0;
+               if (totalMvt > 0) {
+                   finalRisks.push({ name: "Mouvements de terrain (historique)", scope: "Commune", colorCode: 'yellow', severity: `${totalMvt} événement(s) répertorié(s)` });
+               }
+
+               const catnatCount = dataCatnat?.results || dataCatnat?.data?.length || 0;
+               if (catnatCount > 0) {
+                   finalRisks.push({ name: `Catastrophes naturelles historiques`, scope: "Commune", colorCode: 'yellow', severity: `${catnatCount} arrêté(s) CATNAT sur la commune` });
+               }
+
+               let prescriptions = [];
+               if (dataPres?.features?.length > 0) {
+                   const keepKeywords = ['hauteur', 'aspect', 'emprise', 'cos', 'recul', 'alignement', 'retrait', 'densit', 'stationnement'];
+                   prescriptions = dataPres.features.map(f => {
+                       const p = f.properties || {};
+                       return { libelle: p.libelle || 'Prescription', valeur: p.txt || '', type: p.typepsc || '' };
+                   }).filter(p => keepKeywords.some(k => p.libelle.toLowerCase().includes(k)));
+               }
+
+               let servitudes = [];
+               if (dataSup?.features?.length > 0) {
+                   servitudes = dataSup.features.map(f => {
+                       const p = f.properties || {};
+                       let nom = p.nomass || p.libelle || 'Servitude';
+                       nom = nom.replace(/^[A-Z0-9]+_/, '').replace(/_ass$/, '').replace(/_/g, ' ');
+                       return { libelle: nom, type: p.typeass || '', subtype: p.suptype || '' };
+                   }).filter(s => s.libelle);
+               }
+
+               let communeInfo = null;
+               if (dataCommune) {
+                   communeInfo = {
+                       population: dataCommune.population || null,
+                       surface: dataCommune.surface ? (dataCommune.surface / 100).toFixed(0) : null,
+                       codePostal: dataCommune.codesPostaux?.[0] || '',
+                       departement: dataCommune.departement?.nom || '',
+                       region: dataCommune.region?.nom || '',
+                   };
+               }
+
+               let dvfData = [];
+               let prixMoyenM2 = null;
+               let prixMedianM2 = null;
+               const cleanVal = (v) => (v === null || v === undefined || v === 'None' || v === 'none' || v === 'nan' || v === 'NaN' || v === '') ? null : v;
+               
+               try {
+                   let mutationsData = [];
+                   const cacheKey = citycode + '_' + sectionPrefixee;
+                   
+                   if (window.dvfCache[cacheKey]) {
+                       mutationsData = window.dvfCache[cacheKey];
+                   } else {
+                       const etalabRes = await fetch(`https://app.dvf.etalab.gouv.fr/api/mutations3/${citycode}/${sectionPrefixee}`);
+                       if (etalabRes.ok) {
+                           const eJson = await etalabRes.json();
+                           mutationsData = eJson.mutations || [];
+                           window.dvfCache[cacheKey] = mutationsData;
+                       } else {
+                           const cquestRes = await fetch(`https://api.cquest.org/dvf?lat=${lat}&lon=${lon}&dist=100`);
+                           if(cquestRes.ok) {
+                               const cJson = await cquestRes.json();
+                               mutationsData = cJson.resultats || cJson.features || [];
+                           }
+                       }
+                   }
+
+                   const exactMatches = [];
+                   const sectionMatches = [];
+                   const uniqueKeys = new Set();
+                   
+                   mutationsData.forEach(m => {
+                       const props = m.properties || m;
+                       let ids = [];
+                       if(props.id_parcelle) {
+                           if(Array.isArray(props.id_parcelle)) ids = props.id_parcelle;
+                           else if(typeof props.id_parcelle === 'string') ids = props.id_parcelle.split('|').map(s=>s.trim());
+                       }
+
+                       let isExact = false;
+                       let isSameSection = false;
+                       
+                       ids.forEach(id => {
+                           if (!id) return;
+                           if (parcelId && id === parcelId) isExact = true;
+                           else if (sectionPrefixee && id.startsWith(sectionPrefixee)) isSameSection = true;
+                       });
+                       
+                       const nMut = (props.nature_mutation || "").toLowerCase();
+                       if ((isExact || isSameSection) && (nMut.includes("vente") || nMut.includes("adjudication"))) {
+                           const val = props.valeur_fonciere || "NC";
+                           const dateStr = props.date_mutation || "";
+                           const key = `${dateStr}_${val}_${ids[0] || ''}`;
+                           if (!uniqueKeys.has(key)) {
+                               uniqueKeys.add(key);
+                               const displayObj = {
+                                   ...props, displayId: ids[0] || parcelId,
+                                   isExactParcel: isExact, valeur: parseFloat(val) || null,
+                                   dateStr: dateStr
+                               };
+                               if (isExact) exactMatches.push(displayObj);
+                               else sectionMatches.push(displayObj);
+                           }
+                       }
+                   });
+                   
+                   dvfData = [...exactMatches, ...sectionMatches]
+                                .sort((a,b) => new Date(b.dateStr) - new Date(a.dateStr))
+                                .slice(0, 30);
+                   
+                   const prixM2List = dvfData.filter(d => {
+                       const v = d.valeur;
+                       const s = parseFloat(cleanVal(d.surface_reelle_bati)) || parseFloat(cleanVal(d.surface_terrain));
+                       return v && v > 0 && s && s > 0;
+                   }).map(d => {
+                       const s = parseFloat(cleanVal(d.surface_reelle_bati)) || parseFloat(cleanVal(d.surface_terrain));
+                       return d.valeur / s;
+                   });
+                   prixMoyenM2 = prixM2List.length > 0 ? Math.round(prixM2List.reduce((a, b) => a + b, 0) / prixM2List.length) : null;
+                   if (prixM2List.length > 0) {
+                       const sorted = [...prixM2List].sort((a,b) => a - b);
+                       const mid = Math.floor(sorted.length / 2);
+                       prixMedianM2 = Math.round(sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid-1] + sorted[mid]) / 2);
+                   }
+               } catch(e) { console.warn("Erreur DVF", e); }
+               
+               let parcelAddress = '';
+               if (dataGeo?.features?.length > 0) {
+                   parcelAddress = dataGeo.features[0].properties.label || '';
+               }
+               
+               const parcelDataFinal = {
+                  num, section, area: parcel.properties.contenance, city: cityname, citycode: citycode, lon: lon, lat: lat, 
+                  address: parcelAddress, risks: finalRisks, dvf: dvfData, zoning: zoning, isLoading: false, reportUrl: parcelReportUrl,
+                  prescriptions, servitudes, communeInfo, prixMoyenM2, prixMedianM2, reglementUrl
+               };
+               
+               setActiveParcelData(parcelDataFinal);
+               setPolygons(prev => {
+                   const last = prev[prev.length - 1];
+                   if (last && last.isOfficial && last.name === `Parcelle ${num}`) {
+                       return [...prev.slice(0, -1), { ...last, parcelData: parcelDataFinal }];
+                   }
+                   return prev;
+               });
+            } catch(e) {
+               console.error(e);
+               setActiveParcelData({ num, section, city: 'Inconnue', risks: [], dvf: [], isLoading: false, error: true });
+            }
+          }
+        } catch (err) { showToast("Impossible de récupérer la géométrie.", 'error'); }
+        setIsLoading(false);
+      };
+
+      const handleGeolocate = () => {
+        if (!navigator.geolocation) return showToast("Géolocalisation non supportée.", 'error');
+        setIsLoading(true);
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            const lon = position.coords.longitude;
+            const lat = position.coords.latitude;
+            const x = (lon * Math.PI / 180) * R;
+            const y = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) * R;
+            setViewport(v => ({ ...v, center: { x, y }, resolution: 0.5 })); 
+            setLocalImage(null); setMapMode('api'); setMode('auto-select'); setActiveParcelData(null);
+            setIsLoading(false);
+          },
+          (error) => {
+            showToast("Impossible de vous localiser. Vérifiez vos permissions.", 'error');
+            setIsLoading(false);
+          }
+        );
+      };
+
+      const viewportRef = useRef(viewport);
+      useEffect(() => { viewportRef.current = viewport; }, [viewport]);
+
+      // GESTION SOURIS & TOUCH POUR LA CARTE
+      const handleTouchStart = (e) => {
+        if (mapMode === 'none') return;
+        if (e.target.closest && e.target.closest('[data-panel="true"]')) return;
+        const ts = e.touches;
+        if (ts.length === 1) {
+          setIsDragging(true); dragMovedRef.current = false; dragStartRef.current = { x: ts[0].clientX, y: ts[0].clientY };
+        } else if (ts.length >= 2) {
+          setIsDragging(true);
+          const dist = Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY);
+          lastTouchRef.current = { dist };
+        }
+      };
+
+      const handleTouchMove = (e) => {
+        if (!isDragging || mapMode === 'none') return;
+        if (e.target.closest && e.target.closest('[data-panel="true"]')) { setIsDragging(false); return; }
+        
+        const ts = e.touches;
+        if (ts.length === 1) {
+          const dx = ts[0].clientX - dragStartRef.current.x; const dy = ts[0].clientY - dragStartRef.current.y;
+          if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMovedRef.current = true;
+          setViewport(v => ({ ...v, center: { x: v.center.x - dx * v.resolution, y: v.center.y + dy * v.resolution } }));
+          dragStartRef.current = { x: ts[0].clientX, y: ts[0].clientY };
+        } else if (ts.length >= 2 && lastTouchRef.current) {
+          const dist = Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY);
+          const { dist: lastDist } = lastTouchRef.current;
+          if (lastDist > 0) {
+            let newRes = viewportRef.current.resolution / (dist / lastDist);
+            newRes = Math.max(0.05, Math.min(newRes, mapMode === 'api' ? 100 : 10));
+            setViewport(v => ({ ...v, resolution: newRes }));
+          }
+          lastTouchRef.current = { dist };
+        }
+      };
+
+      const handleTouchEnd = (e) => {
+        if (!isDragging) return;
+        if (e.touches.length === 0) {
+          setIsDragging(false);
+          lastTouchRef.current = null;
+          if (!dragMovedRef.current && mapMode !== 'none') {
+            if (e.target.closest && e.target.closest('[data-panel="true"]')) return;
+            const t = e.changedTouches[0];
+            const rect = containerRef.current.getBoundingClientRect();
+            const geo = pxToGeo(t.clientX - rect.left, t.clientY - rect.top, viewportRef.current);
+            if (mode === 'auto-select' && mapMode === 'api') {
+              const lon = (geo.x / R) * 180 / Math.PI;
+              const lat = (2 * Math.atan(Math.exp(geo.y / R)) - Math.PI / 2) * 180 / Math.PI;
+              fetchParcelFromClick(lon, lat);
+            } 
+            else if (mode === 'calibrate' && calibrationPoints.length < 2) setCalibrationPoints(prev => [...prev, geo]);
+            else if (mode === 'draw' || mode === 'measure') setCurrentPoints(prev => [...prev, geo]);
+          }
+        }
+      };
+
+      const handleWheel = (e) => {
+        if (mapMode === 'none') return;
+        if (e.target.closest && e.target.closest('[data-panel="true"]')) return;
+        e.preventDefault();
+        const factor = Math.exp(-e.deltaY * 0.002);
+        let newRes = viewportRef.current.resolution / factor;
+        newRes = Math.max(0.05, Math.min(newRes, mapMode === 'api' ? 100 : 10));
+        const rect = containerRef.current.getBoundingClientRect();
+        const mouseGeo = pxToGeo(e.clientX - rect.left, e.clientY - rect.top, viewportRef.current);
+        const newCx = mouseGeo.x - (e.clientX - rect.left - viewportRef.current.width / 2) * newRes;
+        const newCy = mouseGeo.y + (e.clientY - rect.top - viewportRef.current.height / 2) * newRes;
+        setViewport(v => ({ ...v, center: { x: newCx, y: newCy }, resolution: newRes }));
+      };
+
+      const handleMouseDown = (e) => {
+        if (mapMode === 'none' || e.target.closest('[data-panel="true"]')) return;
+        setIsDragging(true); dragMovedRef.current = false; dragStartRef.current = { x: e.clientX, y: e.clientY };
+      };
+
+      const handleMouseMove = (e) => {
+        if (!isDragging) return;
+        const dx = e.clientX - dragStartRef.current.x; const dy = e.clientY - dragStartRef.current.y;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMovedRef.current = true;
+        setViewport(v => ({ ...v, center: { x: v.center.x - dx * v.resolution, y: v.center.y + dy * v.resolution } }));
+        dragStartRef.current = { x: e.clientX, y: e.clientY };
+      };
+
+      const handleMouseUp = (e) => {
+        if (!isDragging) return;
+        setIsDragging(false);
+        if (!dragMovedRef.current && mapMode !== 'none') {
+          if (e.target.closest && e.target.closest('[data-panel="true"]')) return;
+          const rect = containerRef.current.getBoundingClientRect();
+          const geo = pxToGeo(e.clientX - rect.left, e.clientY - rect.top, viewportRef.current);
+          if (mode === 'auto-select' && mapMode === 'api') {
+            const lon = (geo.x / R) * 180 / Math.PI;
+            const lat = (2 * Math.atan(Math.exp(geo.y / R)) - Math.PI / 2) * 180 / Math.PI;
+            fetchParcelFromClick(lon, lat);
+          } 
+          else if (mode === 'calibrate' && calibrationPoints.length < 2) setCalibrationPoints(prev => [...prev, geo]);
+          else if (mode === 'draw' || mode === 'measure') setCurrentPoints(prev => [...prev, geo]);
+        }
+      };
+
+      const locateDvfParcel = async (parcelIdStr) => {
+        if (!parcelIdStr || parcelIdStr.length < 10) return;
+        const commune = parcelIdStr.substring(0, 5);
+        const section = parcelIdStr.substring(8, 10);
+        const numero = parcelIdStr.substring(10);
+        showToast(`Localisation ${section}${numero}...`, 'info');
+        try {
+          const res = await fetch(`https://apicarto.ign.fr/api/cadastre/parcelle?code_insee=${commune}&section=${section}&numero=${numero}`);
+          if (!res.ok) throw new Error();
+          const data = await res.json();
+          if (data.features && data.features.length > 0) {
+            const parcel = data.features[0];
+            const coords = parcel.geometry.type === 'Polygon' ? parcel.geometry.coordinates[0] : parcel.geometry.coordinates[0][0];
+            let sumLon = 0, sumLat = 0;
+            coords.forEach(c => { sumLon += c[0]; sumLat += c[1]; });
+            const targetX = ((sumLon / coords.length) * Math.PI / 180) * R;
+            const targetY = Math.log(Math.tan(Math.PI / 4 + ((sumLat / coords.length) * Math.PI / 180) / 2)) * R;
+            
+            const geoPoints = coords.map(coord => ({
+              x: (coord[0] * Math.PI / 180) * R, y: Math.log(Math.tan(Math.PI / 4 + (coord[1] * Math.PI / 180) / 2)) * R
+            }));
+            
+            setPolygons(prev => [...prev.filter(p => !p.isDvfHighlight), { 
+              id: uid(), name: `Vente ${section}${numero}`, points: geoPoints, border: '#ef4444', 
+              area: parcel.properties.contenance, isOfficial: false, isDvfHighlight: true
+            }]);
+            
+            const newRes = Math.max((Math.max(...geoPoints.map(p=>p.x)) - Math.min(...geoPoints.map(p=>p.x))) / (viewport.width * 0.6), 0.3);
+            setViewport(v => ({ ...v, center: { x: targetX, y: targetY }, resolution: newRes }));
+            showToast(`Localisée avec succès`, 'success');
+          } else { showToast(`Parcelle introuvable sur le cadastre récent`, 'error'); }
+        } catch(e) { showToast(`Erreur de localisation`, 'error'); }
+      };
+
+      const getTile = (layer, z, x, y) => {
+        const key = `${layer}_${z}_${x}_${y}`;
+        if (tileCache.current[key]) return tileCache.current[key];
+        let url = '';
+        if (layer === 'ortho') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
+        else if (layer === 'plan') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
+        else if (layer === 'cadastre') url = `https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=CADASTRALPARCELS.PARCELLAIRE_EXPRESS&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}`;
+        
+        const tile = { loaded: false, img: new Image() };
+        tileCache.current[key] = tile;
+        tile.img.crossOrigin = "anonymous";
+        tile.img.onload = () => { tile.loaded = true; setRenderTrigger(prev => prev + 1); };
+        tile.img.onerror = () => { tile.error = true; };
+        tile.img.src = url;
+        return tile;
+      };
+
+      const calculateDistance = (pts) => {
+        let dist = 0;
+        for(let i=1; i<pts.length; i++) {
+           const dx = pts[i].x - pts[i-1].x;
+           const dy = pts[i].y - pts[i-1].y;
+           dist += Math.sqrt(dx*dx + dy*dy);
+        }
+        if (mapMode === 'api') {
+           const centerLat = (2 * Math.atan(Math.exp(viewport.center.y / R)) - Math.PI / 2) * 180 / Math.PI;
+           dist *= Math.cos(centerLat * Math.PI / 180);
+        } else if (unitsPerMeter) {
+           dist /= unitsPerMeter;
+        }
+        return dist;
+      };
+
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || viewport.width === 0 || mapMode === 'none') return;
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = viewport.width * dpr; canvas.height = viewport.height * dpr;
+        canvas.style.width = `${viewport.width}px`; canvas.style.height = `${viewport.height}px`;
+        const ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, viewport.width, viewport.height);
+
+        if (baseMap === 'cadastre') { ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0, viewport.width, viewport.height); }
+
+        if (mapMode === 'api') {
+          let z = Math.round(Math.log2(INITIAL_RESOLUTION / viewport.resolution));
+          z = Math.max(0, Math.min(19, z));
+          const vpMinX = viewport.center.x - (viewport.width / 2) * viewport.resolution;
+          const vpMaxX = viewport.center.x + (viewport.width / 2) * viewport.resolution;
+          const vpMinY = viewport.center.y - (viewport.height / 2) * viewport.resolution;
+          const vpMaxY = viewport.center.y + (viewport.height / 2) * viewport.resolution;
+          const minTile = getTileAtGeo(vpMinX, vpMaxY, z);
+          const maxTile = getTileAtGeo(vpMaxX, vpMinY, z);
+
+          const layers = [];
+          if (baseMap === 'ortho') layers.push('ortho', 'cadastre');
+          else if (baseMap === 'plan') layers.push('plan', 'cadastre');
+          else if (baseMap === 'cadastre') layers.push('cadastre');
+
+          layers.forEach(layer => {
+            for (let tx = minTile.tx; tx <= maxTile.tx; tx++) {
+              for (let ty = minTile.ty; ty <= maxTile.ty; ty++) {
+                const tile = getTile(layer, z, tx, ty);
+                const geoTL = getGeoAtTile(tx, ty, z);
+                const geoBR = getGeoAtTile(tx + 1, ty + 1, z);
+                const pxTL = geoToPx(geoTL.gx, geoTL.gy, viewport);
+                const pxBR = geoToPx(geoBR.gx, geoBR.gy, viewport);
+                const w = Math.ceil(pxBR.x - pxTL.x) + 1; const h = Math.ceil(pxBR.y - pxTL.y) + 1;
+
+                if (tile.loaded) {
+                  ctx.drawImage(tile.img, Math.floor(pxTL.x), Math.floor(pxTL.y), w, h);
+                } else if (!tile.error && layer === 'ortho') {
+                  const pTx = Math.floor(tx / 2); const pTy = Math.floor(ty / 2);
+                  const parentTile = tileCache.current[`${layer}_${z-1}_${pTx}_${pTy}`];
+                  if (parentTile && parentTile.loaded) {
+                    const sX = (tx % 2) * 128; const sY = (ty % 2) * 128;
+                    ctx.drawImage(parentTile.img, sX, sY, 128, 128, Math.floor(pxTL.x), Math.floor(pxTL.y), w, h);
+                  } else {
+                    ctx.fillStyle = darkMode ? '#0f172a' : '#e2e8f0'; ctx.fillRect(Math.floor(pxTL.x), Math.floor(pxTL.y), w, h);
+                  }
+                }
+              }
+            }
+          });
+        } else if (mapMode === 'local' && localImage) {
+          const tl = geoToPx(0, localImage.height, viewport);
+          const br = geoToPx(localImage.width, 0, viewport);
+          ctx.drawImage(localImage, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+        }
+
+        lines.forEach(line => {
+           ctx.strokeStyle = line.color; ctx.lineWidth = 4; ctx.beginPath();
+           line.points.forEach((pt, idx) => {
+             const px = geoToPx(pt.x, pt.y, viewport);
+             if(idx===0) ctx.moveTo(px.x, px.y); else ctx.lineTo(px.x, px.y);
+           });
+           ctx.stroke();
+           const lastPt = geoToPx(line.points[line.points.length-1].x, line.points[line.points.length-1].y, viewport);
+           ctx.fillStyle = 'white'; ctx.font = 'bold 14px sans-serif'; ctx.strokeStyle = 'black'; ctx.lineWidth = 3;
+           const text = formatDistance(line.distance);
+           ctx.strokeText(text, lastPt.x + 10, lastPt.y); ctx.fillText(text, lastPt.x + 10, lastPt.y);
+        });
+
+        const drawnLabelsBoxes = [];
+        const checkCollision = (box1, box2) => {
+          const margin = 4; return !(box2.left > box1.right + margin || box2.right < box1.left - margin || box2.top > box1.bottom + margin || box2.bottom < box1.top - margin);
+        };
+
+        polygons.forEach((poly) => {
+          ctx.fillStyle = poly.isDvfHighlight ? hexToRgba(poly.border, 0.8) : hexToRgba(poly.border, polygonOpacity);
+          ctx.strokeStyle = poly.border; ctx.lineWidth = poly.isDvfHighlight ? 5 : 3;
+          ctx.beginPath();
+          poly.points.forEach((pt, index) => {
+            const pxPt = geoToPx(pt.x, pt.y, viewport);
+            if (index === 0) ctx.moveTo(pxPt.x, pxPt.y); else ctx.lineTo(pxPt.x, pxPt.y);
+          });
+          ctx.closePath(); ctx.fill(); ctx.stroke();
+          
+          if (poly.points.length > 0 && !poly.isDvfHighlight) {
+            const pxPoints = poly.points.map(pt => geoToPx(pt.x, pt.y, viewport));
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+            for (let i = 0; i < pxPoints.length; i++) {
+              if (pxPoints[i].x < minX) minX = pxPoints[i].x; if (pxPoints[i].x > maxX) maxX = pxPoints[i].x;
+              if (pxPoints[i].y < minY) minY = pxPoints[i].y; if (pxPoints[i].y > maxY) maxY = pxPoints[i].y;
+            }
+            let targetX = minX + (maxX - minX) / 2; let targetY = minY + (maxY - minY) / 2;
+
+            ctx.fillStyle = 'white'; ctx.font = '900 18px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            const nameText = poly.name;
+            const areaText = poly.area !== null && poly.area !== undefined ? `${formatArea(poly.area, displayUnit)}` : '';
+            const nameMetrics = ctx.measureText(nameText);
+            const areaMetrics = areaText ? ctx.measureText(areaText) : { width: 0 };
+            const textWidth = Math.max(nameMetrics.width, areaMetrics.width) + 10;
+            const textHeight = areaText ? 50 : 25; 
+
+            let collision = true; let attempt = 0; let angle = 0; let radius = 0;
+            while (collision && attempt < 50) {
+                const currentBox = { left: targetX - textWidth/2, right: targetX + textWidth/2, top: targetY - textHeight/2, bottom: targetY + textHeight/2 };
+                collision = drawnLabelsBoxes.some(drawnBox => checkCollision(currentBox, drawnBox));
+                if (collision) {
+                    attempt++; angle += Math.PI / 4; radius += 4; 
+                    targetX = (minX + (maxX - minX) / 2) + Math.cos(angle) * radius;
+                    targetY = (minY + (maxY - minY) / 2) + Math.sin(angle) * radius;
+                } else { drawnLabelsBoxes.push(currentBox); }
+            }
+
+            ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 4;
+            const yOffsetName = areaText ? -12 : 0;
+            ctx.strokeText(nameText, targetX, targetY + yOffsetName); ctx.fillText(nameText, targetX, targetY + yOffsetName);
+            if (areaText) { ctx.strokeText(areaText, targetX, targetY + 14); ctx.fillText(areaText, targetX, targetY + 14); }
+          }
+        });
+
+        if (currentPoints.length > 0 && (mode === 'draw' || mode === 'measure')) {
+          ctx.fillStyle = activeColor; ctx.strokeStyle = activeColor; ctx.lineWidth = 3;
+          ctx.beginPath();
+          currentPoints.forEach((pt, index) => {
+            const pxPt = geoToPx(pt.x, pt.y, viewport);
+            if (index === 0) ctx.moveTo(pxPt.x, pxPt.y); else ctx.lineTo(pxPt.x, pxPt.y);
+            ctx.fillRect(pxPt.x - 5, pxPt.y - 5, 10, 10);
+          });
+          ctx.stroke();
+          
+          if (mode === 'draw' && currentPoints.length > 2) {
+            ctx.beginPath();
+            const lastPt = geoToPx(currentPoints[currentPoints.length - 1].x, currentPoints[currentPoints.length - 1].y, viewport);
+            const firstPt = geoToPx(currentPoints[0].x, currentPoints[0].y, viewport);
+            ctx.moveTo(lastPt.x, lastPt.y); ctx.lineTo(firstPt.x, firstPt.y);
+            ctx.setLineDash([5, 5]); ctx.stroke(); ctx.setLineDash([]);
+          }
+        }
+
+      }, [viewport, renderTrigger, polygons, lines, currentPoints, activeColor, calibrationPoints, mode, displayUnit, mapMode, localImage, darkMode, polygonOpacity, baseMap]);
+
+      const handleImageUpload = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const img = new Image();
+            img.onload = () => {
+              setLocalImage(img); setMapMode('local');
+              setViewport(v => ({ ...v, center: { x: img.width / 2, y: img.height / 2 }, resolution: Math.max(img.width / v.width, img.height / v.height) * 1.05 }));
+              setPolygons([]); setLines([]); setCurrentPoints([]); setCalibrationPoints([]); setUnitsPerMeter(null);
+              setMode('calibrate'); setParcelName('Surface A'); setActiveParcelData(null); setActivePanelTab('diag');
+            };
+            img.src = event.target.result;
+          };
+          reader.readAsDataURL(file);
+        }
+      };
+
+      const applyCalibration = () => {
+        if (calibrationPoints.length === 2 && knownDistance > 0) {
+          const dx = calibrationPoints[1].x - calibrationPoints[0].x;
+          const dy = calibrationPoints[1].y - calibrationPoints[0].y;
+          const distUnits = Math.sqrt(dx * dx + dy * dy);
+          
+          let multiplier = 1;
+          if (calibrationUnit === 'mm') multiplier = 0.001;
+          else if (calibrationUnit === 'cm') multiplier = 0.01;
+          else if (calibrationUnit === 'km') multiplier = 1000;
+          
+          const distanceInMeters = parseFloat(knownDistance) * multiplier;
+          const newUnitsPerMeter = distUnits / distanceInMeters;
+          
+          setUnitsPerMeter(newUnitsPerMeter);
+          setMode('draw');
+
+          setPolygons(prev => prev.map(poly => {
+            if (poly.isOfficial) return poly; 
+            
+            let areaPx = 0;
+            for (let i = 0; i < poly.points.length; i++) {
+              const j = (i + 1) % poly.points.length;
+              areaPx += poly.points[i].x * poly.points[j].y;
+              areaPx -= poly.points[j].x * poly.points[i].y;
+            }
+            areaPx = Math.abs(areaPx) / 2;
+            
+            return { ...poly, area: areaPx / (newUnitsPerMeter * newUnitsPerMeter) };
+          }));
+        }
+      };
+
+      const completePolygon = () => {
+        if (mode === 'measure' && currentPoints.length >= 2) {
+           const dist = calculateDistance(currentPoints);
+           setLines([...lines, { id: uid(), points: currentPoints, color: activeColor, distance: dist }]);
+           setCurrentPoints([]);
+        } 
+        else if (mode === 'draw' && currentPoints.length >= 3) {
+          let area = 0; let realArea = null;
+          for (let i = 0; i < currentPoints.length; i++) {
+            const j = (i + 1) % currentPoints.length;
+            area += currentPoints[i].x * currentPoints[j].y;
+            area -= currentPoints[j].x * currentPoints[i].y;
+          }
+          area = Math.abs(area) / 2;
+
+          if (mapMode === 'api') {
+            const centerLat = (2 * Math.atan(Math.exp(viewport.center.y / R)) - Math.PI / 2) * 180 / Math.PI;
+            realArea = area * Math.cos(centerLat * Math.PI / 180) * Math.cos(centerLat * Math.PI / 180);
+          } else if (unitsPerMeter) realArea = area / (unitsPerMeter * unitsPerMeter);
+          
+          setPolygons([...polygons, { id: uid(), name: parcelName, points: currentPoints, border: activeColor, area: realArea, isOfficial: false }]);
+          setCurrentPoints([]);
+          setParcelName(`${mapMode === 'api' ? 'Parcelle' : 'Surface'} ${String.fromCharCode(65 + polygons.length + 1)}`);
+        }
+      };
+
+      const deletePolygon = (id) => setPolygons(polygons.filter(p => p.id !== id));
+      
+      const handleRenameSubmit = (id, newName) => {
+        setPolygons(prev => prev.map(p => p.id === id ? { ...p, name: newName.trim() || p.name } : p));
+        setEditingPolygonId(null);
+      };
+      
+      const resetImage = () => {
+        setMapMode('none'); setLocalImage(null); setPolygons([]); setLines([]);
+        setAddressQuery(''); setAddressResults([]); setSearchError('');
+        setParcelName('Parcelle A'); setActiveParcelData(null); setActivePanelTab('diag'); tileCache.current = {};
+      };
+
+      const exportProject = () => {
+        const data = { polygons, lines, viewport, mapMode, baseMap, addressQuery, parcelName };
+        const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'surfaces_io_projet.json'; a.click();
+      };
+
+      const importProject = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          try {
+            const data = JSON.parse(event.target.result);
+            if (data.polygons) setPolygons(data.polygons);
+            if (data.lines) setLines(data.lines);
+            if (data.viewport) setViewport(data.viewport);
+            if (data.mapMode) setMapMode(data.mapMode);
+            if (data.baseMap) setBaseMap(data.baseMap);
+            if (data.addressQuery) setAddressQuery(data.addressQuery);
+            if (data.parcelName) setParcelName(data.parcelName);
+            setMode('upload'); setActiveParcelData(null); setActivePanelTab('diag');
+          } catch(err) { showToast("Fichier de sauvegarde invalide ou corrompu.", 'error'); }
+        };
+        reader.readAsText(file);
+      };
+
+      const downloadImage = () => {
+        const link = document.createElement('a'); link.download = 'surfaces-io-export.png';
+        link.href = canvasRef.current.toDataURL('image/png'); link.click();
+      };
+
+      const downloadPDF = () => {
+        if (!canvasRef.current) return;
+        const dataUrl = canvasRef.current.toDataURL('image/png');
+        const printWindow = window.open('', '_blank');
+        if (printWindow) {
+          printWindow.document.write(`
+            <!DOCTYPE html><html><head><title>surfaces.io - Export PDF</title>
+            <style>@page { size: landscape; margin: 0; } body { margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #fff; } img { max-width: 100%; max-height: 100vh; object-fit: contain; }</style>
+            </head><body><img src="${dataUrl}" onload="setTimeout(() => { window.print(); window.close(); }, 200);" /></body></html>
+          `);
+          printWindow.document.close();
+        } else { showToast("Veuillez autoriser les pop-ups pour le PDF.", 'error'); }
+      };
+
+      const getRiskStyles = (colorCode) => {
+         if (colorCode === 'red') return { dot: 'bg-red-500', text: darkMode ? 'text-red-400' : 'text-red-600', border: darkMode ? 'border-red-900/50' : 'border-red-200', bg: darkMode ? 'bg-red-900/20' : 'bg-red-50' };
+         if (colorCode === 'green') return { dot: 'bg-green-500', text: darkMode ? 'text-green-400' : 'text-green-600', border: darkMode ? 'border-green-900/50' : 'border-green-200', bg: darkMode ? 'bg-green-900/20' : 'bg-green-50' };
+         return { dot: 'bg-amber-400', text: darkMode ? 'text-amber-400' : 'text-amber-600', border: darkMode ? 'border-amber-900/50' : 'border-amber-200', bg: darkMode ? 'bg-amber-900/20' : 'bg-amber-50' };
+      };
+
+      const theme = {
+        app: darkMode ? "bg-slate-900 text-slate-200" : "bg-slate-50 text-slate-800",
+        sidebar: darkMode ? "bg-slate-800 border-slate-700" : "bg-white border-slate-200",
+        topbar: darkMode ? "bg-slate-800 border-slate-700" : "bg-white border-slate-200",
+        panel: darkMode ? "bg-slate-900/50 border-slate-700 shadow-none" : "bg-white border-slate-200 shadow-sm",
+        input: darkMode ? "bg-slate-950 border-slate-600 text-white placeholder-slate-500 focus:ring-indigo-500" : "bg-white border-slate-300 text-slate-900 focus:ring-indigo-500",
+        textMain: darkMode ? "text-slate-300" : "text-slate-600",
+        textMuted: darkMode ? "text-slate-400" : "text-slate-500",
+        textTitle: darkMode ? "text-white" : "text-slate-900",
+        border: darkMode ? "border-slate-700" : "border-slate-200",
+        borderLight: darkMode ? "border-slate-700/50" : "border-slate-100",
+        hoverBtn: darkMode ? "hover:bg-slate-700 text-slate-300" : "hover:bg-slate-50 text-slate-700",
+        buttonSecondary: darkMode ? "bg-slate-800 border-slate-600 text-slate-200 hover:bg-slate-700" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50",
+        canvasBg: darkMode ? "bg-slate-950" : "bg-slate-100"
+      };
+
+      return (
+        <div className={`flex h-screen font-sans overflow-hidden select-none transition-colors duration-200 ${theme.app}`}>
+          {toast && <Toast key={toast.key} message={toast.message} type={toast.type} onDone={() => setToast(null)} />}
+          
+          {sidebarOpen && <div className="fixed inset-0 bg-black/50 z-30 md:hidden" onClick={() => setSidebarOpen(false)}></div>}
+          
+          <div className={`${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 fixed md:relative w-80 h-full border-r flex flex-col z-40 md:z-20 transition-all duration-300 ${theme.sidebar} shadow-lg md:shadow-sm`}>
+            <div className={`h-16 flex items-center justify-between px-6 border-b flex-shrink-0 ${theme.borderLight}`}>
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center shadow-indigo-600/30 shadow-lg">
+                  <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"></path></svg>
+                </div>
+                <span className={`text-xl font-bold tracking-tight ${theme.textTitle}`}>surfaces<span className="text-indigo-500">.io</span></span>
+              </div>
+              <button onClick={() => setDarkMode(!darkMode)} className={`relative w-14 h-7 rounded-full transition-colors duration-300 flex items-center ${darkMode ? 'bg-indigo-600' : 'bg-amber-300'}`}>
+                <div className={`absolute w-[22px] h-[22px] rounded-full bg-white shadow-md flex items-center justify-center transition-all duration-300 ${darkMode ? 'left-[30px]' : 'left-[3px]'}`}>
+                  {darkMode ? (
+                    <svg className="w-3.5 h-3.5 text-indigo-600" fill="currentColor" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+                  ) : (
+                    <svg className="w-3.5 h-3.5 text-amber-500" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>
+                  )}
+                </div>
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-6 space-y-8 custom-scrollbar">
+              <section>
+                <h2 className={`text-xs font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>Recherche cadastrale</h2>
+                {mapMode === 'none' ? (
+                  <div className="space-y-4">
+                    <div className="relative">
+                      <svg className={`w-5 h-5 absolute left-3 top-2.5 ${theme.textMuted}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                      <input type="text" placeholder="Rechercher une adresse..." value={addressQuery} onChange={(e) => setAddressQuery(e.target.value)} className={`w-full pl-10 pr-10 py-2 text-sm border rounded-lg outline-none transition-colors shadow-sm ${theme.input}`} />
+                      {isSearching && <div className="absolute right-3 top-2.5"><div className="w-4 h-4 border-2 border-transparent border-t-indigo-500 rounded-full animate-spin"></div></div>}
+                      {!isSearching && addressQuery && <button onClick={() => setAddressQuery('')} className="absolute right-2 top-1.5 p-1 rounded-full hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg></button>}
+                    </div>
+                    {searchError && !isSearching && addressResults.length === 0 && <p className={`text-xs px-1 ${theme.textMuted}`}>{searchError}</p>}
+                    {addressResults.length > 0 && (
+                      <div className={`border rounded-lg overflow-hidden flex flex-col ${theme.panel}`}>
+                        {addressResults.map((feat, idx) => {
+                          const p = feat.properties;
+                          const mainText = p.type === 'municipality' ? `${p.postcode || ''} ${p.name}`.trim() : `${p.name}, ${p.postcode || ''} ${p.city || ''}`.replace(/ ,/, ',').replace(/  +/g, ' ').trim();
+                          return (
+                            <button key={idx} onClick={() => loadMapFromAddress(feat)} className={`w-full text-left px-3 py-3 text-sm border-b last:border-0 transition-colors ${theme.border} ${darkMode ? 'hover:bg-indigo-900/30' : 'hover:bg-indigo-50'}`}>
+                              <span className={`font-medium block ${theme.textTitle}`}>{mainText}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="relative">
+                      <svg className={`w-5 h-5 absolute left-3 top-2.5 ${theme.textMuted}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                      <input type="text" placeholder="Rechercher une adresse..." value={addressQuery} onChange={(e) => setAddressQuery(e.target.value)} className={`w-full pl-10 pr-10 py-2 text-sm border rounded-lg outline-none transition-colors shadow-sm ${theme.input}`} />
+                      {isSearching ? (
+                        <div className="absolute right-3 top-2.5"><div className="w-4 h-4 border-2 border-transparent border-t-indigo-500 rounded-full animate-spin"></div></div>
+                      ) : addressQuery ? (
+                        <button onClick={() => setAddressQuery('')} className="absolute right-2 top-1.5 p-1 rounded-full hover:bg-slate-100 text-slate-400"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg></button>
+                      ) : null}
+                    </div>
+                    {addressResults.length > 0 && (
+                      <div className={`border rounded-lg overflow-hidden flex flex-col ${theme.panel}`}>
+                        {addressResults.map((feat, idx) => {
+                          const p = feat.properties;
+                          const mainText = p.type === 'municipality' ? `${p.postcode || ''} ${p.name}`.trim() : `${p.name}, ${p.postcode || ''} ${p.city || ''}`.replace(/ ,/, ',').replace(/  +/g, ' ').trim();
+                          return (
+                            <button key={idx} onClick={() => loadMapFromAddress(feat)} className={`w-full text-left px-3 py-3 text-sm border-b last:border-0 transition-colors ${theme.border} ${darkMode ? 'hover:bg-indigo-900/30' : 'hover:bg-indigo-50'}`}>
+                              <span className={`font-medium block ${theme.textTitle}`}>{mainText}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+
+              {mapMode !== 'none' && (
+                <section>
+                  <h2 className={`text-xs font-bold uppercase tracking-wider mb-3 ${theme.textMuted}`}>Outils de dessin</h2>
+                  <div className={`border rounded-xl p-4 space-y-4 ${theme.panel}`}>
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <label className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Couleur de la zone</label>
+                      </div>
+                      <div className="flex rounded-lg overflow-hidden h-8 w-full mb-4 shadow-sm border dark:border-slate-700 border-slate-200">
+                        {presetColors.map((c) => (
+                          <button key={c.hex} onClick={() => setActiveColor(c.hex)} className={`flex-1 transition-all flex items-center justify-center ${activeColor === c.hex ? 'opacity-100 shadow-[inset_0_0_0_2px_rgba(255,255,255,0.6)] z-10' : 'opacity-90 hover:opacity-100'}`} style={{ backgroundColor: c.hex }}></button>
+                        ))}
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <label className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Opacité</label>
+                        <input type="range" min="0" max="1" step="0.1" value={polygonOpacity} onChange={e => setPolygonOpacity(parseFloat(e.target.value))} className="flex-1 cursor-pointer" />
+                      </div>
+                    </div>
+                    <hr className={theme.border} />
+                    <div className="grid grid-cols-2 gap-2">
+                       {mapMode === 'api' && (
+                         <button onClick={() => setMode('auto-select')} className={`col-span-2 py-2 rounded-lg text-xs font-medium flex justify-center gap-2 items-center transition-colors ${mode === 'auto-select' ? 'bg-emerald-600 text-white shadow-md' : theme.buttonSecondary}`}>✨ Baguette magique (Auto)</button>
+                       )}
+                       <button onClick={() => setMode('draw')} className={`col-span-1 py-2 rounded-lg text-xs font-medium transition-colors ${mode === 'draw' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}>✏️ Tracer Surface</button>
+                       <button onClick={() => setMode('measure')} className={`col-span-1 py-2 rounded-lg text-xs font-medium transition-colors ${mode === 'measure' ? (darkMode ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-800 text-white shadow-md') : theme.buttonSecondary}`}>📏 Mesurer Ligne</button>
+                    </div>
+                    {(mode === 'draw' || mode === 'measure') && currentPoints.length > 0 && (
+                      <div className={`pt-3 border-t mt-3 ${theme.borderLight}`}>
+                        {mode === 'draw' && <input type="text" value={parcelName} onChange={(e) => setParcelName(e.target.value)} placeholder="Nom de la parcelle" className={`w-full text-xs p-2 mb-2 border rounded outline-none transition-colors ${theme.input}`} />}
+                        <div className="flex gap-2">
+                           <button onClick={() => setCurrentPoints(p => p.slice(0, -1))} className={`flex-1 py-2 border rounded-lg text-[10px] font-medium transition-colors ${theme.buttonSecondary}`}>↩️ Annuler point</button>
+                           <button onClick={() => {}} className="flex-1 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-500 disabled:opacity-50 text-[10px] font-medium transition-colors">✅ Terminer</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
+            </div>
+          </div>
+
+          <div className={`flex-1 w-full md:w-auto flex flex-col relative z-10 transition-colors duration-200 ${theme.canvasBg}`}>
+            
+            {isLoading && (
+              <div className={`absolute inset-0 z-50 backdrop-blur-sm flex flex-col items-center justify-center ${darkMode ? 'bg-slate-900/80 text-emerald-400' : 'bg-white/80 text-emerald-600'}`}>
+                 <div className={`w-12 h-12 border-4 rounded-full animate-spin mb-4 ${darkMode ? 'border-emerald-900 border-t-emerald-400' : 'border-emerald-200 border-t-emerald-600'}`}></div>
+                 <p className="font-medium">Analyse Géospatiale en cours...</p>
+              </div>
+            )}
+
+            <div className={`h-14 md:h-16 flex items-center justify-between px-3 md:px-6 gap-2 border-b z-20 shadow-sm transition-colors duration-200 ${theme.topbar}`}>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button onClick={() => setSidebarOpen(!sidebarOpen)} className={`md:hidden p-1.5 rounded-lg transition-colors ${theme.hoverBtn}`}>
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+                </button>
+                <h1 className={`hidden md:block text-lg font-medium ${theme.textTitle}`}>Visionneuse Interactive</h1>
+                {mode === 'auto-select' && <span className={`hidden sm:inline px-2 py-1 text-[10px] font-bold rounded-full animate-pulse border ${darkMode ? 'bg-emerald-900/40 text-emerald-400 border-emerald-800' : 'bg-emerald-100 text-emerald-800 border-emerald-200'}`}>Auto-Sélection</span>}
+              </div>
+              <div className="md:hidden flex-1 relative">
+                <svg className={`w-4 h-4 absolute left-2.5 top-2 ${theme.textMuted}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                <input type="text" placeholder="Rechercher..." value={addressQuery} onChange={(e) => setAddressQuery(e.target.value)} className={`w-full pl-8 pr-8 py-1.5 text-xs border rounded-full outline-none ${theme.input}`} />
+                {isSearching && <div className="absolute right-2.5 top-2"><div className="w-3 h-3 border-2 border-transparent border-t-indigo-500 rounded-full animate-spin"></div></div>}
+                {!isSearching && addressQuery && <button onClick={() => setAddressQuery('')} className="absolute right-2 top-1 p-0.5 rounded-full text-slate-400"><svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg></button>}
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {mapMode !== 'none' && (
+                  <button onClick={handleGeolocate} className={`md:hidden w-9 h-9 rounded-full flex items-center justify-center transition-colors shadow-sm ${darkMode ? 'bg-indigo-600 text-white hover:bg-indigo-500' : 'bg-indigo-600 text-white hover:bg-indigo-700'}`}>
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div 
+              ref={containerRef}
+              style={{ touchAction: 'none' }}
+              className={`flex-1 relative overflow-hidden transition-colors duration-200 select-none ${theme.canvasBg} ${mapMode === 'none' ? '' : (isDragging ? 'cursor-grabbing' : (mode === 'upload' ? 'cursor-grab' : 'cursor-crosshair'))}`}
+              onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
+              onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd}
+              onWheel={handleWheel}
+            >
+              {mapMode === 'none' ? (
+                <div className={`absolute inset-0 flex flex-col items-center justify-center max-w-md mx-auto text-center ${theme.textMuted}`}>
+                  <button onClick={handleGeolocate} className={`w-20 h-20 rounded-full flex items-center justify-center mb-6 shadow-inner cursor-pointer transition-all hover:scale-110 hover:shadow-lg ${darkMode ? 'bg-indigo-900/30 text-indigo-400' : 'bg-indigo-50 text-indigo-400'}`}>
+                    <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                  </button>
+                  <p className={`text-xl font-semibold mb-2 ${theme.textTitle}`}>Bienvenue sur surfaces.io</p>
+                  <p>Recherchez une adresse ou cliquez sur l'icône pour vous géolocaliser.</p>
+                </div>
+              ) : (
+                <>
+                  <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
+                  
+                  {Object.keys(areaSummaryByColor).length > 0 && (
+                    <div className="absolute top-2 md:top-4 left-2 md:left-4 z-30 pointer-events-none">
+                      <div className={`p-2 md:p-4 rounded-xl shadow-lg border min-w-[160px] md:min-w-[220px] pointer-events-auto select-text transition-colors duration-200 cursor-auto ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`} data-panel="true">
+                        <h3 className={`text-[9px] md:text-[10px] font-bold uppercase tracking-wider mb-2 md:mb-3 ${theme.textMuted}`}>Récapitulatif</h3>
+                        <div className="space-y-1.5 md:space-y-2.5">
+                          {Object.entries(areaSummaryByColor).map(([color, totalArea]) => (
+                            <div key={color} className="flex items-center justify-between gap-4 md:gap-6">
+                              <div className="flex items-center gap-2">
+                                <div className="w-2.5 md:w-3 h-2.5 md:h-3 rounded-full shadow-sm" style={{ backgroundColor: color }}></div>
+                              </div>
+                              <span className={`text-xs md:text-sm font-bold ${theme.textMain}`}>{formatArea(totalArea, displayUnit)}</span>
+                            </div>
+                          ))}
+                        </div>
+                        <div className={`mt-2 md:mt-3 pt-2 md:pt-3 border-t flex justify-between items-center ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
+                          <span className={`text-[10px] md:text-xs font-bold uppercase ${theme.textMuted}`}>Total</span>
+                          <span className={`text-xs md:text-sm font-black ${darkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>{formatArea(Object.values(areaSummaryByColor).reduce((a, b) => a + b, 0), displayUnit)}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className={`hidden md:flex absolute bottom-6 right-6 flex-col gap-3 z-30 pointer-events-auto`} data-panel="true">
+                     {mapMode === 'api' && (
+                        <div className={`flex flex-col bg-white rounded-lg shadow-lg border overflow-hidden cursor-auto ${darkMode ? 'bg-slate-800 border-slate-600' : 'bg-white border-slate-200'}`}>
+                           <button onClick={() => setBaseMap('ortho')} className={`px-3 py-2 text-[10px] font-bold uppercase ${baseMap === 'ortho' ? 'bg-emerald-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Satellite</button>
+                           <button onClick={() => setBaseMap('plan')} className={`px-3 py-2 text-[10px] font-bold uppercase border-y ${darkMode ? 'border-slate-700' : 'border-slate-100'} ${baseMap === 'plan' ? 'bg-emerald-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Plan IGN</button>
+                           <button onClick={() => setBaseMap('cadastre')} className={`px-3 py-2 text-[10px] font-bold uppercase ${baseMap === 'cadastre' ? 'bg-emerald-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Cadastre</button>
+                        </div>
+                     )}
+
+                     <button onClick={handleGeolocate} className={`p-3 rounded-full shadow-lg border flex items-center justify-center transition-transform hover:scale-105 cursor-pointer ${darkMode ? 'bg-emerald-600 border-emerald-500 text-white' : 'bg-white border-slate-200 text-emerald-600'}`} title="Me localiser">
+                       <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                     </button>
+                  </div>
+                </>
+              )}
+            </div>
+
+          {activeParcelData && mapMode !== 'none' && (
+            <div className={`fixed bottom-0 left-0 right-0 md:absolute md:top-20 md:right-6 md:left-auto md:bottom-auto z-50 md:z-30 pointer-events-none`}>
+              <div 
+                className={`select-text p-3 md:p-4 shadow-2xl border w-full md:w-[340px] max-h-[60vh] md:max-h-[80vh] overflow-y-auto overscroll-contain flex flex-col rounded-t-2xl md:rounded-xl custom-scrollbar pb-8 md:pb-4 pointer-events-auto ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}
+                style={{ WebkitOverflowScrolling: 'touch', touchAction: 'pan-y' }}
+                onTouchStart={e => e.stopPropagation()}
+                onTouchMove={e => e.stopPropagation()}
+                onWheel={e => e.stopPropagation()}
+                data-panel="true"
+              >
+                <div className="md:hidden flex justify-center mb-2">
+                  <div className={`w-10 h-1 rounded-full ${darkMode ? 'bg-slate-600' : 'bg-slate-300'}`}></div>
+                </div>
+                       <div className="flex justify-between items-center mb-3">
+                       <div className="flex flex-1 rounded-lg overflow-hidden border" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>
+                           {[
+                               { id: 'diag', label: 'Risques' },
+                               { id: 'dvf', label: 'DVF' },
+                               { id: 'urba', label: 'Urbanisme' },
+                           ].map(tab => (
+                               <button key={tab.id} onClick={() => setActivePanelTab(tab.id)} className={`flex-1 px-2 py-1.5 text-[8px] md:text-[9px] font-bold uppercase tracking-wider transition-colors ${activePanelTab === tab.id ? 'bg-emerald-600 text-white' : (darkMode ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-white text-slate-500 hover:bg-slate-50')}`}>
+                                   {tab.label}
+                               </button>
+                           ))}
+                           <button onClick={() => setActivePanelTab('plans')} className={`md:hidden flex-1 px-2 py-1.5 text-[8px] font-bold uppercase tracking-wider transition-colors ${activePanelTab === 'plans' ? 'bg-emerald-600 text-white' : (darkMode ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-white text-slate-500 hover:bg-slate-50')}`}>Plans</button>
+                       </div>
+                       <button onClick={() => setActiveParcelData(null)} className={`ml-2 flex-shrink-0 text-slate-400 hover:text-red-500 transition-colors`}>
+                           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                       </button>
+                   </div>
+                   
+                   <div className="mb-3">
+                       <div className="overflow-hidden flex-1">
+                           <div className={`text-lg font-black tracking-tight ${theme.textTitle}`}>Parcelle {activeParcelData.num}</div>
+                           <div className={`text-[10px] font-mono mt-0.5 ${theme.textMuted}`}>{activeParcelData.citycode} 000 {activeParcelData.section} {(activeParcelData.num || '').padStart(4, '0')}</div>
+                           <div className={`flex items-center gap-1.5 mt-2 flex-wrap`}>
+                               <span className={`text-[10px] uppercase font-bold px-2 py-1 rounded-md ${darkMode ? 'bg-indigo-900/50 text-indigo-300 border border-indigo-700' : 'bg-indigo-50 text-indigo-700 border border-indigo-200'}`}>
+                                   Section {activeParcelData.section}
+                               </span>
+                               {activeParcelData.zoning && (
+                                   <span className={`text-[10px] px-2 py-1 rounded-md font-bold ${darkMode ? 'bg-sky-900/40 text-sky-300 border border-sky-700' : 'bg-sky-50 text-sky-700 border border-sky-200'}`}>
+                                       {activeParcelData.zoning}
+                                   </span>
+                               )}
+                           </div>
+                           <div className={`mt-2 flex items-center gap-4`}>
+                               <div className="flex items-center gap-1.5">
+                                   <svg className={`w-3.5 h-3.5 ${theme.textMuted}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"></path></svg>
+                                   <span className={`text-xs font-bold ${theme.textTitle}`}>{activeParcelData.area ? activeParcelData.area.toLocaleString('fr-FR') + ' m²' : 'NC'}</span>
+                               </div>
+                           </div>
+                           <div className={`flex items-center gap-1.5 mt-1.5`}>
+                               <svg className={`w-3.5 h-3.5 flex-shrink-0 ${theme.textMuted}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                               <span className={`text-[11px] ${theme.textMuted}`}>{activeParcelData.address || activeParcelData.city || 'Localisation...'}</span>
+                           </div>
+                       </div>
+                   </div>
+
+                   {activeParcelData.isLoading ? (
+                       <div className="space-y-2 animate-pulse mt-2">
+                           <div className={`h-2.5 rounded w-3/4 ${darkMode ? 'bg-slate-700' : 'bg-slate-200'}`}></div>
+                           <div className={`h-2.5 rounded w-1/2 ${darkMode ? 'bg-slate-700' : 'bg-slate-200'}`}></div>
+                           <div className={`h-2.5 rounded w-5/6 ${darkMode ? 'bg-slate-700' : 'bg-slate-200'}`}></div>
+                           <p className={`text-[10px] mt-4 text-center ${theme.textMuted}`}>Interrogation des bases de l'État en cours...</p>
+                       </div>
+                   ) : (
+                       <>
+                         {activePanelTab === 'diag' && (
+                           <div>
+                               {activeParcelData.risks && activeParcelData.risks.length > 0 ? (
+                                   <details className={`rounded-lg border overflow-hidden group ${darkMode ? 'bg-slate-800/30 border-slate-700/50' : 'bg-slate-50/50 border-slate-200/50'}`}>
+                                       <summary className={`flex items-center gap-2 px-3 py-2.5 cursor-pointer select-none ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
+                                           <span className={`text-[10px] font-bold uppercase tracking-wider flex-1`}>Risques répertoriés ({activeParcelData.risks.length})</span>
+                                           <svg className="w-3.5 h-3.5 transition-transform group-open:rotate-180 flex-shrink-0 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+                                       </summary>
+                                       <div className={`px-2 pb-2 space-y-1 border-t ${darkMode ? 'border-slate-700/50' : 'border-slate-200/50'}`}>
+                                           {activeParcelData.risks.map((risk, idx) => {
+                                               const styles = getRiskStyles(risk.colorCode);
+                                               return (
+                                                   <div key={idx} className={`flex items-center gap-2 px-2 py-1.5 rounded ${darkMode ? 'hover:bg-slate-700/30' : 'hover:bg-slate-100/50'}`}>
+                                                       <span className={`w-2 h-2 rounded-full flex-shrink-0 ${styles.dot}`}></span>
+                                                       <span className={`text-[10px] flex-1 ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>{risk.name}</span>
+                                                       <span className={`text-[9px] uppercase font-bold px-1 py-0.5 rounded ${styles.bg} ${styles.text} ${styles.border} border`}>
+                                                           {risk.severity}
+                                                       </span>
+                                                   </div>
+                                               );
+                                           })}
+                                       </div>
+                                   </details>
+                               ) : (
+                                   <div className={`text-[11px] font-medium p-3 rounded-lg border ${darkMode ? 'bg-emerald-900/20 border-emerald-800/50 text-emerald-400' : 'bg-emerald-50 border-emerald-200 text-emerald-700'}`}>
+                                       Aucun risque majeur répertorié.
+                                   </div>
+                               )}
+                               
+                               <div className="mt-4 pt-3 border-t flex flex-col gap-2" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>
+                                  <p className={`text-[9px] text-center leading-relaxed mb-1 ${theme.textMuted}`}>
+                                      Données communales — pour le détail à l'adresse exacte :
+                                  </p>
+                                  <a href={activeParcelData.reportUrl} target="_blank" rel="noreferrer" className={`w-full py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider text-center transition-all flex items-center justify-center gap-1.5 shadow-sm hover:scale-[1.01] ${darkMode ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-emerald-600 text-white hover:bg-emerald-700'}`}>
+                                      Rapport complet Géorisques
+                                  </a>
+                                  <p className={`text-[9px] text-center mt-1 ${theme.textMuted}`}>Sources : Géorisques · GPU · IGN · DGFiP</p>
+                               </div>
+                           </div>
+                         )}
+                         
+                         {activePanelTab === 'dvf' && (
+                           <div>
+                               <div className="flex items-center justify-between mb-2">
+                                   <div className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Ventes ({activeParcelData.dvf?.length || 0})</div>
+                                   <div className={`text-[8px] ${theme.textMuted}`}>Section {activeParcelData.section}</div>
+                               </div>
+                               {dvfLinks.length > 0 && (
+                                   <button onClick={() => { setDvfLinks([]); setPolygons(prev => prev.filter(p => !p.isDvfHighlight)); }} className={`w-full mb-2 py-1.5 rounded-lg text-[9px] font-bold text-center transition-all ${darkMode ? 'bg-red-900/30 text-red-400 border border-red-800/50 hover:bg-red-900/50' : 'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100'}`}>
+                                       Effacer les localisations ({dvfLinks.length})
+                                   </button>
+                               )}
+                               <p className={`text-[8px] mb-2 ${theme.textMuted}`}>Cliquez sur une vente de la section pour la localiser sur la carte.</p>
+                               {activeParcelData.dvf && activeParcelData.dvf.length > 0 ? (
+                                   <div className="space-y-2">
+                                       {activeParcelData.dvf.map((sale, idx) => {
+                                           const clean = (v) => (v === null || v === undefined || v === 'None' || v === 'none' || v === 'nan' || v === 'NaN' || v === '') ? null : v;
+                                           const saleType = clean(sale.type_local);
+                                           const saleSurfBati = clean(sale.surface_reelle_bati);
+                                           const saleSurfTerrain = clean(sale.surface_terrain);
+                                           const details = [sale.nature_mutation || 'Vente'];
+                                           if (saleType) details.push(saleType);
+                                           if (saleSurfBati && saleSurfBati !== '0' && saleSurfBati !== '0.0') details.push(`${parseFloat(saleSurfBati)} m² bâti`);
+                                           if (saleSurfTerrain && saleSurfTerrain !== '0' && saleSurfTerrain !== '0.0') details.push(`${parseFloat(saleSurfTerrain)} m² terrain`);
+                                           
+                                           const surfM2 = parseFloat(saleSurfBati) || parseFloat(saleSurfTerrain) || 0;
+                                           const prixM2 = (sale.valeur && surfM2 > 0) ? Math.round(sale.valeur / surfM2) : null;
+                                           const canLocate = !sale.isExactParcel && sale.displayId && sale.displayId.length >= 10;
+                                           
+                                           return (
+                                           <div key={idx} onClick={() => { if (canLocate) locateDvfParcel(sale.displayId); }}
+                                             className={`p-2.5 rounded-lg border transition-all ${canLocate ? 'cursor-pointer hover:ring-1 hover:ring-amber-400/50' : ''} ${
+                                             sale.isExactParcel 
+                                               ? (darkMode ? 'bg-indigo-950/60 border-indigo-500 ring-1 ring-indigo-500/30' : 'bg-indigo-50/80 border-indigo-400 ring-1 ring-indigo-300/50')
+                                               : (darkMode ? 'bg-slate-800/50 border-slate-700/50 opacity-80 hover:opacity-100' : 'bg-slate-50 border-slate-200/50 opacity-80 hover:opacity-100')
+                                           }`}>
+                                               <div className="flex justify-between items-start mb-1.5">
+                                                   <div className="flex flex-col">
+                                                       <div className="flex items-baseline gap-2">
+                                                           <span className={`font-bold ${sale.isExactParcel ? 'text-base' : 'text-sm'} ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
+                                                               {sale.valeur ? new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(sale.valeur) : 'Prix NC'}
+                                                           </span>
+                                                           {prixM2 && <span className={`text-[9px] font-bold ${darkMode ? 'text-emerald-400' : 'text-emerald-600'}`}>{prixM2.toLocaleString('fr-FR')} €/m²</span>}
+                                                       </div>
+                                                       <div className="flex items-center gap-1 mt-1 flex-wrap">
+                                                           <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold border ${sale.isExactParcel ? (darkMode ? 'bg-indigo-900/70 text-indigo-300 border-indigo-700' : 'bg-indigo-100 text-indigo-800 border-indigo-300') : (darkMode ? 'bg-slate-700 text-slate-400 border-slate-600' : 'bg-slate-200 text-slate-600 border-slate-300')}`}>
+                                                               {sale.isExactParcel ? 'CETTE PARCELLE' : `N°${(sale.displayId || '').slice(-4)}`}
+                                                           </span>
+                                                       </div>
+                                                   </div>
+                                                   <span className={`text-[10px] font-medium px-2 py-1 rounded shadow-sm border ${darkMode ? 'bg-slate-800 text-slate-300 border-slate-600' : 'bg-white text-slate-700 border-slate-200'}`}>
+                                                       {sale.dateStr ? new Date(sale.dateStr).toLocaleDateString('fr-FR') : 'NC'}
+                                                   </span>
+                                               </div>
+                                               <div className={`text-[10px] mt-1 ${theme.textMuted}`}>{details.join(' • ')}</div>
+                                           </div>
+                                           );
+                                       })}
+                                   </div>
+                               ) : (
+                                   <div className={`text-[11px] font-medium p-4 text-center rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50 text-slate-400' : 'bg-slate-50 border-slate-200/50 text-slate-500'}`}>
+                                       Aucune vente publique n'a été trouvée pour cette section cadastrale.
+                                   </div>
+                               )}
+                               <div className="mt-4 pt-3 border-t flex flex-col gap-2" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>
+                                  <a href={`https://app.dvf.etalab.gouv.fr/?code_departement=${activeParcelData.citycode?.substring(0,2)}&code_commune=${activeParcelData.citycode}`} target="_blank" rel="noreferrer" className={`w-full py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider text-center transition-all flex items-center justify-center gap-1.5 shadow-sm hover:scale-[1.01] ${darkMode ? 'bg-indigo-600 hover:bg-indigo-500 text-white' : 'bg-indigo-600 text-white hover:bg-indigo-700'}`}>
+                                      Explorer les ventes sur DVF Etalab
+                                  </a>
+                                  <p className={`text-[9px] text-center ${theme.textMuted}`}>Source : DVF · DGFiP · Etalab</p>
+                               </div>
+                           </div>
+                         )}
+
+                         {/* ONGLET 3 : URBANISME */}
+                         {activePanelTab === 'urba' && (
+                           <div>
+                               {(activeParcelData.prixMoyenM2 || activeParcelData.zoning) && (
+                                   <div className="mb-3">
+                                       <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Synthèse parcelle</div>
+                                       <div className={`grid grid-cols-2 gap-2`}>
+                                           {(() => {
+                                               const exactSale = activeParcelData.dvf?.find(d => d.isExactParcel);
+                                               if (exactSale && exactSale.valeur) {
+                                                   return (
+                                                       <div className={`p-2 rounded-lg border ${darkMode ? 'bg-emerald-900/20 border-emerald-800/50' : 'bg-emerald-50 border-emerald-200'}`}>
+                                                           <div className={`text-[9px] ${theme.textMuted}`}>Dernière vente connue</div>
+                                                           <div className={`text-sm font-bold ${darkMode ? 'text-emerald-400' : 'text-emerald-700'}`}>{exactSale.valeur.toLocaleString('fr-FR')} €</div>
+                                                       </div>
+                                                   );
+                                               } else if (activeParcelData.prixMoyenM2) {
+                                                   return (
+                                                       <div className={`p-2 rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+                                                           <div className={`text-[9px] ${theme.textMuted}`}>Prix moyen section</div>
+                                                           <div className={`text-sm font-bold ${darkMode ? 'text-emerald-400' : 'text-emerald-700'}`}>{activeParcelData.prixMoyenM2.toLocaleString('fr-FR')} €/m²</div>
+                                                       </div>
+                                                   );
+                                               }
+                                               return null;
+                                           })()}
+                                           {activeParcelData.zoning && (
+                                               <div className={`p-2 rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+                                                   <div className={`text-[9px] ${theme.textMuted}`}>Constructibilité</div>
+                                                   {(() => {
+                                                       const z = (activeParcelData.zoning || '').toUpperCase();
+                                                       if (z.startsWith('U ') || z.startsWith('U(') || z === 'U') return <div className={`text-sm font-bold ${darkMode ? 'text-emerald-400' : 'text-emerald-600'}`}>Constructible</div>;
+                                                       if (z.includes('AU')) return <div className={`text-sm font-bold ${darkMode ? 'text-amber-400' : 'text-amber-600'}`}>À urbaniser</div>;
+                                                       if (z.startsWith('A ') || z === 'A') return <div className={`text-sm font-bold ${darkMode ? 'text-red-400' : 'text-red-600'}`}>Agricole</div>;
+                                                       if (z.startsWith('N') && !z.includes('AU')) return <div className={`text-sm font-bold ${darkMode ? 'text-red-400' : 'text-red-600'}`}>Naturelle</div>;
+                                                       return <div className={`text-sm font-bold ${darkMode ? 'text-emerald-400' : 'text-emerald-600'}`}>Constructible</div>;
+                                                   })()}
+                                               </div>
+                                           )}
+                                       </div>
+                                   </div>
+                               )}
+                               
+                               {activeParcelData.prescriptions && activeParcelData.prescriptions.length > 0 && (
+                                   <div className="mb-3">
+                                       <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Prescriptions ({activeParcelData.prescriptions.length})</div>
+                                       <div className="space-y-1.5">
+                                           {activeParcelData.prescriptions.map((p, idx) => {
+                                               const isReadable = p.valeur && p.valeur.length < 20 && !p.valeur.match(/^[a-z]{5,}$/i);
+                                               return (
+                                               <div key={idx} className={`p-2 rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+                                                   <div className="flex justify-between items-start gap-2">
+                                                       <span className={`text-[10px] font-semibold ${theme.textTitle}`}>{p.libelle}</span>
+                                                       {isReadable && <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded whitespace-nowrap ${darkMode ? 'bg-indigo-900/50 text-indigo-400 border border-indigo-800' : 'bg-indigo-50 text-indigo-700 border border-indigo-200'}`}>{p.valeur}</span>}
+                                                   </div>
+                                               </div>
+                                               );
+                                           })}
+                                       </div>
+                                   </div>
+                               )}
+
+                               {activeParcelData.servitudes && activeParcelData.servitudes.length > 0 && (
+                                   <div className="mb-3">
+                                       <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Servitudes d'utilité publique ({activeParcelData.servitudes.length})</div>
+                                       <div className="space-y-1.5">
+                                           {activeParcelData.servitudes.map((s, idx) => (
+                                               <div key={idx} className={`p-2 rounded-lg border text-[10px] ${darkMode ? 'bg-amber-900/20 border-amber-800/50 text-amber-400' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                                                   <div className="font-semibold">{s.libelle}</div>
+                                               </div>
+                                           ))}
+                                       </div>
+                                   </div>
+                               )}
+                               <div className="mt-3 pt-3 border-t flex flex-col gap-2" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>
+                                   <a href={`https://www.geoportail-urbanisme.gouv.fr/map/#tile=1&lon=${activeParcelData.lon}&lat=${activeParcelData.lat}&zoom=17`} target="_blank" rel="noreferrer" className={`w-full py-2 rounded-lg text-[9px] font-bold uppercase tracking-wider text-center transition-all flex items-center justify-center shadow-sm hover:scale-[1.01] ${darkMode ? 'bg-sky-600 hover:bg-sky-500 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}>
+                                       Ouvrir le Plan Local d'Urbanisme (GPU)
+                                   </a>
+                               </div>
+                           </div>
+                         )}
+
+                         {/* ONGLET 5 : PLANS (mobile uniquement) */}
+                         {activePanelTab === 'plans' && (
+                           <div className="space-y-2">
+                               <div className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Fond de carte</div>
+                               {[
+                                   { id: 'ortho', label: 'Satellite', icon: '🛰' },
+                                   { id: 'plan', label: 'Plan IGN', icon: '🗺' },
+                                   { id: 'cadastre', label: 'Cadastre', icon: '📐' },
+                               ].map(m => (
+                                   <button key={m.id} onClick={() => { setBaseMap(m.id); setActivePanelTab('diag'); }} className={`w-full flex items-center gap-3 p-3 rounded-lg border text-left transition-all ${baseMap === m.id ? (darkMode ? 'bg-emerald-900/30 border-emerald-700 text-emerald-400' : 'bg-emerald-50 border-emerald-300 text-emerald-700') : (darkMode ? 'bg-slate-800/50 border-slate-700 text-slate-300 hover:bg-slate-700/50' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50')}`}>
+                                       <span className="text-lg">{m.icon}</span>
+                                       <span className="text-sm font-bold">{m.label}</span>
+                                       {baseMap === m.id && <svg className="w-4 h-4 ml-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>}
+                                   </button>
+                               ))}
+                           </div>
+                         )}
+                       </>
+                   )}
+              </div>
+            </div>
+          )}
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
