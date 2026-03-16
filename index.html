@@ -14,19 +14,26 @@
   <style>
     body, html { margin: 0; padding: 0; overflow: hidden; background-color: #f8fafc; }
     input[type=range] { accent-color: #2A9D8F; }
-    .custom-scrollbar::-webkit-scrollbar { width: 8px; }
+    
+    /* Ajout de height: 6px pour affiner la barre horizontale sur PC */
+    .custom-scrollbar::-webkit-scrollbar { width: 8px; height: 6px; }
     .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
     .custom-scrollbar::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; min-height: 40px; }
     .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #64748b; }
     .dark .custom-scrollbar::-webkit-scrollbar-thumb { background: #475569; }
     .dark .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #64748b; }
+    
+    /* Utilitaires pour cacher la barre sur mobile (tout en gardant le swipe) */
+    @media (max-width: 768px) {
+      .custom-scrollbar::-webkit-scrollbar { width: 4px; height: 0px; }
+      .mobile-no-scrollbar::-webkit-scrollbar { display: none; }
+      .mobile-no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    }
+
     details > summary { list-style: none; }
     details > summary::-webkit-details-marker { display: none; }
     input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
     input[type=number] { -moz-appearance: textfield; }
-    @media (max-width: 768px) {
-      .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-    }
     .toast-in { animation: toastIn .3s ease-out forwards; }
     .toast-out { animation: toastOut .3s ease-in forwards; }
     @keyframes toastIn { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
@@ -267,22 +274,48 @@
         setActivePanelTab('synthese');
       };
 
+      // FONCTION ANTI-CRASH globale (déplacée ici pour être utilisable par le bouton relance)
+      const fetchWithTimeout = async (url, timeout = 3000) => {
+          const controller = new AbortController();
+          const id = setTimeout(() => controller.abort(), timeout);
+          try {
+              const response = await fetch(url, { signal: controller.signal });
+              clearTimeout(id);
+              return response;
+          } catch (error) {
+              clearTimeout(id);
+              return { ok: false }; 
+          }
+      };
+
+      // Fonction pour le bouton manuel de relance SITADEL
+      const handleReloadSitadel = async () => {
+          if (!activeParcelData || !activeParcelData.citycode) return;
+          setActiveParcelData(prev => ({ ...prev, sitadelLoading: true }));
+          try {
+              const url = `https://data.statistiques.developpement-durable.gouv.fr/api/explore/v2.1/catalog/datasets/sitadel-logements-autorises-commences/records?where=code_commune="${activeParcelData.citycode}"&limit=10`;
+              const res = await fetchWithTimeout(url, 8000); // 8 secondes de délai pour la tentative manuelle
+              if (res.ok) {
+                 const data = await res.json();
+                 const permis = data.results.map(p => ({
+                     date: p.date_autorisation || p.date_depot || 'Date NC',
+                     nature: p.nature_projet || 'Construction',
+                     surface: p.surface_creee || 0,
+                     logements: p.nombre_logements || 0,
+                     etat: p.etat_dossier || 'Autorisé'
+                 })).filter(p => p.surface > 0 || p.logements > 0);
+                 setActiveParcelData(prev => ({ ...prev, permis, sitadelLoading: false, sitadelError: false }));
+              } else {
+                 setActiveParcelData(prev => ({ ...prev, sitadelLoading: false, sitadelError: true }));
+              }
+          } catch(e) {
+              setActiveParcelData(prev => ({ ...prev, sitadelLoading: false, sitadelError: true }));
+          }
+      };
+
       const fetchParcelFromClick = async (lon, lat) => {
         setIsLoading(true);
         setSearchMarker(null); // <-- Efface le point rouge lors du clic sur la carte
-        // FONCTION ANTI-CRASH : Coupe la requête si le serveur met plus de 3 secondes à répondre
-        const fetchWithTimeout = async (url, timeout = 3000) => {
-            const controller = new AbortController();
-            const id = setTimeout(() => controller.abort(), timeout);
-            try {
-                const response = await fetch(url, { signal: controller.signal });
-                clearTimeout(id);
-                return response;
-            } catch (error) {
-                clearTimeout(id);
-                return { ok: false }; // Retourne une fausse erreur propre au lieu de crasher
-            }
-        };
         try {
           const geomQuery = JSON.stringify({ type: "Point", coordinates: [lon, lat] });
           const res = await fetch(`https://apicarto.ign.fr/api/cadastre/parcelle?geom=${encodeURIComponent(geomQuery)}`);
@@ -363,7 +396,10 @@
 
                // On lance toutes les requêtes en parallèle pour la rapidité
                const geomPoint = encodeURIComponent(JSON.stringify({type:"Point",coordinates:[lon,lat]}));
-               const [resRadon, resGaspar, resCavites, resMvt, resPpr, resCatnat, resPrescriptions, resServitudes, resCommune, resAlti, resEcoles, resDpe, resIcpe, resBasias, resSitadel] = await Promise.allSettled([
+               const overpassQuery = `[out:json][timeout:4];(node["shop"~"supermarket|bakery|convenience"](around:1500,${lat},${lon});node["amenity"~"pharmacy|hospital|clinic|doctors"](around:1500,${lat},${lon});node["highway"="bus_stop"](around:1500,${lat},${lon});node["public_transport"="station"](around:1500,${lat},${lon}););out 50;`;
+
+               const [resRadon, resGaspar, resCavites, resMvt, resPpr, resCatnat, resPrescriptions, resServitudes, resCommune, resAlti, resEcoles, resDpe, resIcpe, resBasias, resSitadel, resOverpass] = await Promise.allSettled([
+                   fetch(`https://www.georisques.gouv.fr/api/v1/radon?code_insee=${citycode}`).then(r => r.ok ? r.json() : null),
                    fetch(`https://www.georisques.gouv.fr/api/v1/radon?code_insee=${citycode}`).then(r => r.ok ? r.json() : null),
                    fetch(`https://www.georisques.gouv.fr/api/v1/gaspar/risques?code_insee=${citycode}`).then(r => r.ok ? r.json() : null),
                    fetch(`https://www.georisques.gouv.fr/api/v1/cavites?code_insee=${citycode}&page=1&page_size=10`).then(r => r.ok ? r.json() : null),
@@ -373,12 +409,13 @@
                    fetch(`https://apicarto.ign.fr/api/gpu/prescription-surf?geom=${geomPoint}`).then(r => r.ok ? r.json() : null),
                    fetch(`https://apicarto.ign.fr/api/gpu/assiette-sup-s?geom=${geomPoint}`).then(r => r.ok ? r.json() : null),
                    fetch(`https://geo.api.gouv.fr/communes/${citycode}?fields=nom,population,surface,codesPostaux,departement,region`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://wxs.ign.fr/calcul/alti/rest/elevation.json?lon=${lon}&lat=${lat}`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://data.education.gouv.fr/api/explore/v2.1/catalog/datasets/fr-en-annuaire-education/records?limit=30&where=distance(position,geom'POINT(${lon} ${lat})',3000)`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://data.ademe.fr/data-fair/api/v1/datasets/dpe-v2-logements-existants/lines?q_mode=simple&geo_distance=${lon},${lat},50&size=5`).then(r => r.ok ? r.json() : null),
+                   fetch(`https://data.geopf.fr/altimetrie/1.0/calcul/alti/rest/elevation.json?lon=${lon}&lat=${lat}`).then(r => r.ok ? r.json() : null),
+                   fetch(`https://data.education.gouv.fr/api/explore/v2.1/catalog/datasets/fr-en-annuaire-education/records?limit=30&where=within_distance(position,geom'POINT(${lon} ${lat})',3km)`).then(r => r.ok ? r.json() : null),
+                   fetch(`https://data.ademe.fr/data-fair/api/v1/datasets/dpe-v2-logements-existants/lines?q_mode=simple&geo_distance=${lon},${lat},150&size=5`).then(r => r.ok ? r.json() : null),
                    fetch(`https://www.georisques.gouv.fr/api/v1/installations_classees?lat=${lat}&lon=${lon}&rayon=1000&page_size=10`).then(r => r.ok ? r.json() : null),
                    fetch(`https://www.georisques.gouv.fr/api/v1/anciens_sites_industriels?lat=${lat}&lon=${lon}&rayon=1000&page_size=10`).then(r => r.ok ? r.json() : null),
-                   fetchWithTimeout(`https://data.statistiques.developpement-durable.gouv.fr/api/explore/v2.1/catalog/datasets/sitadel-logements-autorises-commences/records?where=code_commune="${citycode}"&limit=10`).then(r => r.ok ? r.json() : null)
+                   fetchWithTimeout(`https://data.statistiques.developpement-durable.gouv.fr/api/explore/v2.1/catalog/datasets/sitadel-logements-autorises-commences/records?where=code_commune="${citycode}"&limit=10`).then(r => r.ok ? r.json() : null),
+                   fetchWithTimeout(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(overpassQuery)}`, 5000).then(r => r.ok ? r.json() : null)
                ]);
 
                // ── RADON ──
@@ -588,10 +625,9 @@
                    const dataEcoles = resEcoles.status === 'fulfilled' ? resEcoles.value : null;
                    if (dataEcoles && dataEcoles.results) {
                        dataEcoles.results.forEach(ec => {
-                           if (!ec.latitude || !ec.longitude || ec.etat_etablissement !== 1) return; // Uniquement écoles ouvertes
+                           if (!ec.latitude || !ec.longitude || String(ec.etat_etablissement) !== '1') return; // Uniquement écoles ouvertes
                            const eLat = ec.latitude; const eLon = ec.longitude;
                            const dLat = (eLat - lat) * Math.PI / 180; const dLon = (eLon - lon) * Math.PI / 180;
-                           const a2 = Math.sin(dLat/2)**2 + Math.cos(lat*Math.PI/180)*Math.cos(eLat*Math.PI/180)*Math.sin(dLon/2)**2;
                            const distM = Math.round(6371000 * 2 * Math.atan2(Math.sqrt(a2), Math.sqrt(1-a2)));
                            ecoles.push({ nom: ec.nom_etablissement, type: ec.type_etablissement, public_prive: ec.statut_public_prive, dist: distM });
                        });
@@ -633,6 +669,7 @@
 
                // ── PERMIS DE CONSTRUIRE (SITADEL) ──
                let permis = [];
+               let sitadelError = false;
                try {
                    const dataSitadel = resSitadel.status === 'fulfilled' ? resSitadel.value : null;
                    if (dataSitadel && dataSitadel.results) {
@@ -642,7 +679,25 @@
                            surface: p.surface_creee || 0,
                            logements: p.nombre_logements || 0,
                            etat: p.etat_dossier || 'Autorisé'
-                       })).filter(p => p.surface > 0 || p.logements > 0); // On ne garde que les vrais projets
+                       })).filter(p => p.surface > 0 || p.logements > 0);
+                   } else if (dataSitadel && dataSitadel.ok === false) {
+                       sitadelError = true;
+                   } else if (!dataSitadel) {
+                       sitadelError = true;
+                   }
+               } catch(e) { sitadelError = true; }
+
+               // ── COMMODITÉS DE QUARTIER (OpenStreetMap) ──
+               let commodites = { alimentation: 0, sante: 0, transport: 0 };
+               try {
+                   const dataOsm = resOverpass.status === 'fulfilled' ? resOverpass.value : null;
+                   if (dataOsm && dataOsm.elements) {
+                       dataOsm.elements.forEach(el => {
+                           const tags = el.tags || {};
+                           if (tags.shop) commodites.alimentation++;
+                           else if (tags.amenity) commodites.sante++;
+                           else if (tags.highway === 'bus_stop' || tags.public_transport === 'station') commodites.transport++;
+                       });
                    }
                } catch(e) {}
 
@@ -815,7 +870,7 @@
                   num, section, area: parcel.properties.contenance, city: cityname, citycode: citycode, lon: lon, lat: lat, 
                   address: parcelAddress,
                   risks: finalRisks, dvf: dvfData, zoning: zoning, isLoading: false, reportUrl: parcelReportUrl,
-                  prescriptions, servitudes, communeInfo, prixMoyenM2, prixMedianM2, reglementUrl, altitude, ecoles, dpe, permis
+                  prescriptions, servitudes, communeInfo, prixMoyenM2, prixMedianM2, reglementUrl, altitude, ecoles, dpe, permis, sitadelError, commodites
                };
                setActiveParcelData(parcelDataFinal);
                // Stocker les données dans le polygon pour pouvoir les restaurer au clic sidebar
@@ -856,7 +911,8 @@
           (error) => {
             showToast("Impossible de vous localiser. Vérifiez vos permissions.", 'error');
             setIsLoading(false);
-          }
+          },
+          { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 } // <-- FORCE LE VRAI GPS DU TÉLÉPHONE
         );
       };
 
@@ -2107,8 +2163,7 @@
                         <div className={`flex flex-col bg-white rounded-lg shadow-lg border overflow-hidden cursor-auto ${darkMode ? 'bg-slate-800 border-slate-600' : 'bg-white border-slate-200'}`}>
                            <button onClick={() => setBaseMap('ortho')} className={`px-3 py-2 text-[10px] font-bold uppercase ${baseMap === 'ortho' ? 'bg-emerald-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Satellite</button>
                            <button onClick={() => setBaseMap('plan')} className={`px-3 py-2 text-[10px] font-bold uppercase border-t ${darkMode ? 'border-slate-700' : 'border-slate-100'} ${baseMap === 'plan' ? 'bg-emerald-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Plan IGN</button>
-                           <button onClick={() => setBaseMap('osm')} className={`px-3 py-2 text-[10px] font-bold uppercase border-t ${darkMode ? 'border-slate-700' : 'border-slate-100'} ${baseMap === 'osm' ? 'bg-emerald-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Rues (OSM)</button>
-                           <button onClick={() => setBaseMap('cadastre')} className={`px-3 py-2 text-[10px] font-bold uppercase border-t ${darkMode ? 'border-slate-700' : 'border-slate-100'} ${baseMap === 'cadastre' ? 'bg-emerald-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Cadastre</button>
+                           <button onClick={() => setBaseMap('osm')} className={`px-3 py-2 text-[10px] font-bold uppercase border-t ${darkMode ? 'border-slate-700' : 'border-slate-100'} ${baseMap === 'osm' ? 'bg-emerald-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Plan de Rues</button>                           <button onClick={() => setBaseMap('cadastre')} className={`px-3 py-2 text-[10px] font-bold uppercase border-t ${darkMode ? 'border-slate-700' : 'border-slate-100'} ${baseMap === 'cadastre' ? 'bg-emerald-500 text-white' : (darkMode ? 'text-slate-300 hover:bg-slate-700' : 'text-slate-600 hover:bg-slate-50')}`}>Cadastre</button>
                         </div>
                      )}
 
@@ -2163,8 +2218,7 @@
                   <div className={`w-12 h-1.5 rounded-full ${darkMode ? 'bg-slate-500' : 'bg-slate-300'}`}></div>
                 </div>
                        <div className="flex justify-between items-center mb-3">
-                       <div className="flex flex-1 rounded-lg overflow-x-auto custom-scrollbar border" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>
-                           {[
+                           <div className="flex flex-1 rounded-lg overflow-x-auto custom-scrollbar mobile-no-scrollbar border" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>                           {[
                                { id: 'synthese', label: 'Synthèse' },
                                { id: 'urba', label: 'Bâti' },
                                { id: 'diag', label: 'Risques' },
@@ -2346,6 +2400,27 @@
                          {/* ONGLET QUARTIER */}
                          {activePanelTab === 'quartier' && (
                            <div className="pb-4 space-y-3">
+                               {/* SECTION COMMODITÉS */}
+                               <div className="mb-3">
+                                   <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Commodités (Rayon 1.5 km)</div>
+                                   <div className="grid grid-cols-3 gap-2">
+                                       <div className={`p-2 rounded-lg border flex flex-col items-center justify-center text-center ${darkMode ? 'bg-orange-900/20 border-orange-800/50' : 'bg-orange-50 border-orange-200'}`}>
+                                           <span className="text-lg mb-1">🥖</span>
+                                           <span className={`text-[11px] font-bold ${darkMode ? 'text-orange-400' : 'text-orange-700'}`}>{activeParcelData.commodites?.alimentation || 0}</span>
+                                           <span className={`text-[8px] ${theme.textMuted}`}>Commerces</span>
+                                       </div>
+                                       <div className={`p-2 rounded-lg border flex flex-col items-center justify-center text-center ${darkMode ? 'bg-blue-900/20 border-blue-800/50' : 'bg-blue-50 border-blue-200'}`}>
+                                           <span className="text-lg mb-1">🩺</span>
+                                           <span className={`text-[11px] font-bold ${darkMode ? 'text-blue-400' : 'text-blue-700'}`}>{activeParcelData.commodites?.sante || 0}</span>
+                                           <span className={`text-[8px] ${theme.textMuted}`}>Santé</span>
+                                       </div>
+                                       <div className={`p-2 rounded-lg border flex flex-col items-center justify-center text-center ${darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-100 border-slate-300'}`}>
+                                           <span className="text-lg mb-1">🚌</span>
+                                           <span className={`text-[11px] font-bold ${theme.textTitle}`}>{activeParcelData.commodites?.transport || 0}</span>
+                                           <span className={`text-[8px] ${theme.textMuted}`}>Transports</span>
+                                       </div>
+                                   </div>
+                               </div>
                                {activeParcelData.ecoles && activeParcelData.ecoles.length > 0 ? (
                                    <div>
                                        <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Écoles à proximité ({activeParcelData.ecoles.length})</div>
@@ -2386,7 +2461,12 @@
                                {/* SECTION PERMIS DE CONSTRUIRE (SITADEL) */}
                                <div className="mb-3">
                                    <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Permis de construire (Commune)</div>
-                                   {activeParcelData.permis && activeParcelData.permis.length > 0 ? (
+                                   {activeParcelData.sitadelLoading ? (
+                                       <div className={`p-4 text-center rounded-lg border flex flex-col items-center gap-2 ${darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200/50'}`}>
+                                           <div className="w-4 h-4 border-2 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
+                                           <span className={`text-[10px] ${theme.textMuted}`}>Recherche en cours...</span>
+                                       </div>
+                                   ) : activeParcelData.permis && activeParcelData.permis.length > 0 ? (
                                        <div className="space-y-2 max-h-[250px] overflow-y-auto custom-scrollbar pr-1">
                                            {activeParcelData.permis.map((p, idx) => (
                                                <div key={idx} className={`p-2 rounded-lg border ${darkMode ? 'bg-sky-900/10 border-sky-800/30' : 'bg-sky-50/50 border-sky-200'}`}>
@@ -2403,10 +2483,17 @@
                                                </div>
                                            ))}
                                        </div>
+                                   ) : activeParcelData.sitadelError ? (
+                                       <div className={`p-3 text-center rounded-lg border flex flex-col items-center gap-2 ${darkMode ? 'bg-slate-800/50 border-slate-700/50 text-slate-400' : 'bg-slate-50 border-slate-200/50 text-slate-500'}`}>
+                                           <span className="text-[10px] font-medium">Le serveur de l'État n'a pas répondu à temps.</span>
+                                           <button onClick={handleReloadSitadel} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-bold uppercase transition-colors ${darkMode ? 'bg-sky-900/50 text-sky-400 hover:bg-sky-900' : 'bg-sky-100 text-sky-700 hover:bg-sky-200'}`}>
+                                               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                               Forcer la recherche
+                                           </button>
+                                       </div>
                                    ) : (
                                        <div className={`text-[10px] font-medium p-3 text-center rounded-lg border flex flex-col items-center gap-1 ${darkMode ? 'bg-slate-800/50 border-slate-700/50 text-slate-400' : 'bg-slate-50 border-slate-200/50 text-slate-500'}`}>
                                            <span>Aucun projet majeur récent trouvé.</span>
-                                           <span className="text-[8px] opacity-70">(Ou serveurs d'État momentanément indisponibles)</span>
                                        </div>
                                    )}
                                </div>
@@ -2441,7 +2528,7 @@
                                                    </div>
                                                );
                                            })}
-                                           <div className={`text-[8px] text-center mt-1 ${theme.textMuted}`}>Source : ADEME (Rayon 50m)</div>
+                                           <div className={`text-[8px] text-center mt-1 ${theme.textMuted}`}>Source : ADEME (Rayon 150m)</div>
                                        </div>
                                    ) : (
                                        <div className={`text-[10px] font-medium p-3 text-center rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50 text-slate-400' : 'bg-slate-50 border-slate-200/50 text-slate-500'}`}>
@@ -2687,8 +2774,8 @@
                                <div className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Fond de carte</div>
                                {[
                                    { id: 'ortho', label: 'Satellite', icon: '🛰' },
+                                   { id: 'osm', label: 'Plan de Rues', icon: '📍' },
                                    { id: 'plan', label: 'Plan IGN', icon: '🗺' },
-				   { id: 'osm', label: 'Rues (OSM)', icon: '📍' },
                                    { id: 'cadastre', label: 'Cadastre', icon: '📐' },
                                ].map(m => (
                                    <button key={m.id} onClick={() => { setBaseMap(m.id); setActivePanelTab('synthese'); }} className={`w-full flex items-center gap-3 p-3 rounded-lg border text-left transition-all ${baseMap === m.id ? (darkMode ? 'bg-emerald-900/30 border-emerald-700 text-emerald-400' : 'bg-emerald-50 border-emerald-300 text-emerald-700') : (darkMode ? 'bg-slate-800/50 border-slate-700 text-slate-300 hover:bg-slate-700/50' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50')}`}>
