@@ -116,6 +116,9 @@
       
       const [activeParcelData, setActiveParcelData] = useState(null);
       const [activePanelTab, setActivePanelTab] = useState('synthese'); 
+      const [activeCommoTab, setActiveCommoTab] = useState('alimentation');
+      const [commoLimit, setCommoLimit] = useState(10);
+      const [poiSearch, setPoiSearch] = useState('');
       
       const [isDragging, setIsDragging] = useState(false);
       const dragStartRef = useRef({ x: 0, y: 0 });
@@ -253,8 +256,8 @@
         const label = feature.properties.label;
         setSearchHistory(prev => [{ label, feature }, ...prev.filter(h => h.label !== label)].slice(0, 5));
         setAddressResults([]);
-        setAddressQuery(feature.properties.label);
-        const lon = feature.geometry.coordinates[0];
+          setAddressQuery(''); // On vide la barre pour forcer l'affichage de l'historique
+          const lon = feature.geometry.coordinates[0];
         const lat = feature.geometry.coordinates[1];
         setSearchMarker({lon,lat});
         const x = (lon * Math.PI / 180) * R;
@@ -293,24 +296,76 @@
           if (!activeParcelData || !activeParcelData.citycode) return;
           setActiveParcelData(prev => ({ ...prev, sitadelLoading: true }));
           try {
-              const url = `https://data.statistiques.developpement-durable.gouv.fr/api/explore/v2.1/catalog/datasets/sitadel-logements-autorises-commences/records?where=code_commune="${activeParcelData.citycode}"&limit=10`;
-              const res = await fetchWithTimeout(url, 8000); // 8 secondes de délai pour la tentative manuelle
+              const url = `https://data.statistiques.developpement-durable.gouv.fr/api/explore/v2.1/catalog/datasets/sitadel-logements-autorises-commences/records?limit=100&where=code_commune%3D%22${activeParcelData.citycode}%22`; 
+              const res = await fetchWithTimeout(url, 8000);
               if (res.ok) {
                  const data = await res.json();
-                 const permis = data.results.map(p => ({
-                     date: p.date_autorisation || p.date_depot || 'Date NC',
-                     nature: p.nature_projet || 'Construction',
-                     surface: p.surface_creee || 0,
-                     logements: p.nombre_logements || 0,
-                     etat: p.etat_dossier || 'Autorisé'
-                 })).filter(p => p.surface > 0 || p.logements > 0);
-                 setActiveParcelData(prev => ({ ...prev, permis, sitadelLoading: false, sitadelError: false }));
+                 const streetLower = (activeParcelData.streetName || '').toLowerCase();
+                 let permisLocals = (data.results || []).map(p => {
+                     return {
+                         date: p.date_autorisation || p.date_depot || 'Date NC',
+                         nature: p.nature_projet || 'Construction',
+                         surface: p.surface_creee || 0,
+                         logements: p.nombre_logements || 0,
+                         etat: p.etat_dossier || 'Autorisé',
+                         adresse: (p.adresse_terrain || '').toLowerCase()
+                     };
+                 }).filter(p => p.surface > 0 || p.logements > 0);
+
+                 if (streetLower.length > 3) {
+                     const filtered = permisLocals.filter(p => p.adresse.includes(streetLower));
+                     if (filtered.length > 0) permisLocals = filtered;
+                 }
+                 setActiveParcelData(prev => ({ ...prev, permis: permisLocals.slice(0, 15), sitadelLoading: false, sitadelError: false }));
               } else {
                  setActiveParcelData(prev => ({ ...prev, sitadelLoading: false, sitadelError: true }));
               }
           } catch(e) {
               setActiveParcelData(prev => ({ ...prev, sitadelLoading: false, sitadelError: true }));
           }
+      };
+
+      // Fonction pour recharger manuellement les Commodités (OSM)
+      const handleReloadOsm = async () => {
+          if (!activeParcelData || !activeParcelData.lat || !activeParcelData.lon) return;
+          setActiveParcelData(prev => ({ ...prev, osmLoading: true }));
+          try {
+              const lat = activeParcelData.lat; const lon = activeParcelData.lon;
+              const overpassQuery = `[out:json][timeout:15];(node["shop"~"supermarket|bakery|convenience"](around:1500,${lat},${lon});way["shop"~"supermarket|bakery|convenience"](around:1500,${lat},${lon});node["amenity"~"pharmacy|hospital|clinic|doctors"](around:1500,${lat},${lon});way["amenity"~"pharmacy|hospital|clinic|doctors"](around:1500,${lat},${lon});node["highway"="bus_stop"](around:1500,${lat},${lon});node["public_transport"="station"](around:1500,${lat},${lon});node["amenity"~"school|kindergarten|college|university"](around:1500,${lat},${lon});way["amenity"~"school|kindergarten|college|university"](around:1500,${lat},${lon}););out center;`;
+              const res = await fetch(`https://overpass-api.de/api/interpreter`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: "data=" + encodeURIComponent(overpassQuery) });
+              if (res.ok) {
+                  const dataOsm = await res.json();
+                  let newCommo = { alimentation: [], sante: [], transport: [] };
+                  let newEcoles = [];
+                  if (dataOsm && dataOsm.elements) {
+                      dataOsm.elements.forEach(el => {
+                           const tags = el.tags || {};
+                           let cLat = el.lat || (el.center && el.center.lat);
+                           let cLon = el.lon || (el.center && el.center.lon);
+                           if (!cLat || !cLon) return;
+                           const dLat = (cLat - lat) * Math.PI / 180; const dLon = (cLon - lon) * Math.PI / 180;
+                           const a2 = Math.sin(dLat/2)**2 + Math.cos(lat*Math.PI/180)*Math.cos(cLat*Math.PI/180)*Math.sin(dLon/2)**2;
+                           const distM = Math.round(6371000 * 2 * Math.atan2(Math.sqrt(a2), Math.sqrt(1-a2)));
+                           let name = tags.name || tags.brand || tags.operator || 'Inconnu';
+                           if (tags.shop) { newCommo.alimentation.push({ nom: name, type: tags.shop === 'bakery' ? 'Boulangerie' : 'Supermarché/Commerce', dist: distM, lat: cLat, lon: cLon });
+                           } else if (tags.highway === 'bus_stop' || tags.public_transport === 'station') {
+                               if (name === 'Inconnu' && tags.ref) name = 'Ligne ' + tags.ref;
+                               newCommo.transport.push({ nom: name, type: tags.highway === 'bus_stop' ? 'Arrêt de bus' : 'Station', dist: distM, lat: cLat, lon: cLon });
+                           } else if (tags.amenity) {
+                               if (tags.amenity.match(/school|kindergarten|college|university/)) {
+                                   let type = 'École';
+                                   if (tags.amenity === 'kindergarten') type = 'Maternelle';
+                                   if (tags.amenity === 'college' || name.toLowerCase().includes('collège')) type = 'Collège';
+                                   if (tags.amenity === 'university' || name.toLowerCase().includes('lycée')) type = 'Lycée / Supérieur';
+                                   newEcoles.push({ nom: name, type: type, dist: distM, lat: cLat, lon: cLon });
+                               } else { newCommo.sante.push({ nom: name, type: tags.amenity === 'pharmacy' ? 'Pharmacie' : 'Centre Médical', dist: distM, lat: cLat, lon: cLon }); }
+                           }
+                      });
+                      newCommo.alimentation.sort((a,b)=>a.dist - b.dist); newCommo.sante.sort((a,b)=>a.dist - b.dist); newCommo.transport.sort((a,b)=>a.dist - b.dist); newEcoles.sort((a,b)=>a.dist - b.dist);
+                  }
+                  setActiveParcelData(prev => ({ ...prev, commodites: newCommo, ecoles: newEcoles, osmLoading: false }));
+              } else { setActiveParcelData(prev => ({ ...prev, osmLoading: false })); }
+          } catch(e) { setActiveParcelData(prev => ({ ...prev, osmLoading: false })); }
       };
 
       const fetchParcelFromClick = async (lon, lat) => {
@@ -365,10 +420,12 @@
             try {
                const resGeo = await fetch(`https://api-adresse.data.gouv.fr/reverse/?lon=${lon}&lat=${lat}`);
                const dataGeo = await resGeo.json();
-               let citycode = ''; let cityname = '';
+               let citycode = ''; let cityname = ''; let streetName = '';
                if(dataGeo.features && dataGeo.features.length > 0) {
-                   citycode = dataGeo.features[0].properties.citycode;
-                   cityname = dataGeo.features[0].properties.city;
+                   const p = dataGeo.features[0].properties;
+                   citycode = p.citycode;
+                   cityname = p.city;
+                   if (p.type === 'housenumber' || p.type === 'street') streetName = p.name;
                }
                
                // ZONAGE PLU + lien règlement (un seul appel)
@@ -396,27 +453,26 @@
 
                // On lance toutes les requêtes en parallèle pour la rapidité
                const geomPoint = encodeURIComponent(JSON.stringify({type:"Point",coordinates:[lon,lat]}));
-               const overpassQuery = `[out:json][timeout:4];(node["shop"~"supermarket|bakery|convenience"](around:1500,${lat},${lon});node["amenity"~"pharmacy|hospital|clinic|doctors"](around:1500,${lat},${lon});node["highway"="bus_stop"](around:1500,${lat},${lon});node["public_transport"="station"](around:1500,${lat},${lon}););out 50;`;
+               const overpassQuery = `[out:json][timeout:10];(node["shop"~"supermarket|bakery|convenience"](around:1500,${lat},${lon});way["shop"~"supermarket|bakery|convenience"](around:1500,${lat},${lon});node["amenity"~"pharmacy|hospital|clinic|doctors"](around:1500,${lat},${lon});way["amenity"~"pharmacy|hospital|clinic|doctors"](around:1500,${lat},${lon});node["highway"="bus_stop"](around:1500,${lat},${lon});node["public_transport"="station"](around:1500,${lat},${lon});node["amenity"~"school|kindergarten|college|university"](around:1500,${lat},${lon});way["amenity"~"school|kindergarten|college|university"](around:1500,${lat},${lon}););out center;`;
 
-               const [resRadon, resGaspar, resCavites, resMvt, resPpr, resCatnat, resPrescriptions, resServitudes, resCommune, resAlti, resEcoles, resDpe, resIcpe, resBasias, resSitadel, resOverpass] = await Promise.allSettled([
-                   fetch(`https://www.georisques.gouv.fr/api/v1/radon?code_insee=${citycode}`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://www.georisques.gouv.fr/api/v1/radon?code_insee=${citycode}`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://www.georisques.gouv.fr/api/v1/gaspar/risques?code_insee=${citycode}`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://www.georisques.gouv.fr/api/v1/cavites?code_insee=${citycode}&page=1&page_size=10`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://www.georisques.gouv.fr/api/v1/mvt?code_insee=${citycode}&page=1&page_size=10`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://www.georisques.gouv.fr/api/v1/ppr?code_insee=${citycode}&page=1&page_size=50`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://www.georisques.gouv.fr/api/v1/gaspar/catnat?code_insee=${citycode}&page=1&page_size=100`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://apicarto.ign.fr/api/gpu/prescription-surf?geom=${geomPoint}`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://apicarto.ign.fr/api/gpu/assiette-sup-s?geom=${geomPoint}`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://geo.api.gouv.fr/communes/${citycode}?fields=nom,population,surface,codesPostaux,departement,region`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://data.geopf.fr/altimetrie/1.0/calcul/alti/rest/elevation.json?lon=${lon}&lat=${lat}`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://data.education.gouv.fr/api/explore/v2.1/catalog/datasets/fr-en-annuaire-education/records?limit=30&where=within_distance(position,geom'POINT(${lon} ${lat})',3km)`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://data.ademe.fr/data-fair/api/v1/datasets/dpe-v2-logements-existants/lines?q_mode=simple&geo_distance=${lon},${lat},150&size=5`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://www.georisques.gouv.fr/api/v1/installations_classees?lat=${lat}&lon=${lon}&rayon=1000&page_size=10`).then(r => r.ok ? r.json() : null),
-                   fetch(`https://www.georisques.gouv.fr/api/v1/anciens_sites_industriels?lat=${lat}&lon=${lon}&rayon=1000&page_size=10`).then(r => r.ok ? r.json() : null),
-                   fetchWithTimeout(`https://data.statistiques.developpement-durable.gouv.fr/api/explore/v2.1/catalog/datasets/sitadel-logements-autorises-commences/records?where=code_commune="${citycode}"&limit=10`).then(r => r.ok ? r.json() : null),
-                   fetchWithTimeout(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(overpassQuery)}`, 5000).then(r => r.ok ? r.json() : null)
-               ]);
+                   const [resRadon, resGaspar, resCavites, resMvt, resPpr, resCatnat, resPrescriptions, resServitudes, resCommune, resAlti, resEcoles, resDpe, resIcpe, resBasias, resSitadel, resOverpass] = await Promise.allSettled([
+                       fetch(`https://www.georisques.gouv.fr/api/v1/radon?code_insee=${citycode}`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://www.georisques.gouv.fr/api/v1/gaspar/risques?code_insee=${citycode}`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://www.georisques.gouv.fr/api/v1/cavites?code_insee=${citycode}&page=1&page_size=10`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://www.georisques.gouv.fr/api/v1/mvt?code_insee=${citycode}&page=1&page_size=10`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://www.georisques.gouv.fr/api/v1/ppr?code_insee=${citycode}&page=1&page_size=50`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://www.georisques.gouv.fr/api/v1/gaspar/catnat?code_insee=${citycode}&page=1&page_size=100`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://apicarto.ign.fr/api/gpu/prescription-surf?geom=${geomPoint}`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://apicarto.ign.fr/api/gpu/assiette-sup-s?geom=${geomPoint}`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://geo.api.gouv.fr/communes/${citycode}?fields=nom,population,surface,codesPostaux,departement,region`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://data.geopf.fr/altimetrie/1.0/calcul/alti/rest/elevation.json?lon=${lon}&lat=${lat}&resource=ign_rge_alti_wld`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://data.education.gouv.fr/api/explore/v2.1/catalog/datasets/fr-en-annuaire-education/records?limit=30&where=within_distance(position,geom'POINT(${lon} ${lat})',3km)`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://data.ademe.fr/data-fair/api/v1/datasets/dpe-v2-logements-existants/lines?q_mode=simple&geo_distance=${lon},${lat},500&size=10`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://www.georisques.gouv.fr/api/v1/installations_classees?lat=${lat}&lon=${lon}&rayon=1000&page_size=10`).then(r => r.ok ? r.json() : null),
+                       fetch(`https://www.georisques.gouv.fr/api/v1/anciens_sites_industriels?lat=${lat}&lon=${lon}&rayon=1000&page_size=10`).then(r => r.ok ? r.json() : null),
+                       Promise.resolve(null), // SITADEL est ignoré ici pour ne pas bloquer l'écran
+                       fetch(`https://overpass-api.de/api/interpreter`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: "data=" + encodeURIComponent(overpassQuery) }).then(r => r.ok ? r.json() : null)
+                   ]);
 
                // ── RADON ──
                try {
@@ -438,7 +494,6 @@
                        let sismiciteAdded = false;
 
                        dataGaspar.data.forEach(item => {
-                           // Extraire la zone sismique si présente (une seule fois)
                            if (!sismiciteAdded && item.risques_detail) {
                                item.risques_detail.forEach(detail => {
                                    if (detail.zone_sismicite && !sismiciteAdded) {
@@ -455,12 +510,10 @@
                                });
                            }
 
-                           // Tous les risques GASPAR (plus de filtrage argile/séisme !)
                            if (item.risques_detail && Array.isArray(item.risques_detail)) {
                                item.risques_detail.forEach(detail => {
                                    const riskName = detail.libelle_risque_long || '';
                                    if (!riskName || seenRisks.has(riskName.toLowerCase())) return;
-                                   // Ignorer séisme ici (déjà traité au-dessus avec la zone)
                                    if (riskName.toLowerCase().includes('séisme') || riskName.toLowerCase().includes('seisme')) return;
                                    seenRisks.add(riskName.toLowerCase());
                                    
@@ -469,19 +522,16 @@
                                    const sLow = sev.toLowerCase();
                                    const rnLow = riskName.toLowerCase();
                                    
-                                   // Couleur basée sur le niveau ET le type de risque
                                    if (sLow.includes('fort') || sLow.includes('élevé') || sLow.includes('majeur') || sLow.includes('important')) color = 'red';
                                    else if (sLow.includes('faible') || sLow.includes('nul') || sLow.includes('pas de risque') || sLow.includes('abrogé')) color = 'green';
                                    else if (sLow.includes('existant') || sLow.includes('concern') || sLow.includes('reconnu')) color = 'yellow';
                                    
-                                   // Forcer rouge pour certains risques graves
                                    if (rnLow.includes('rupture') || rnLow.includes('seveso') || rnLow.includes('nucléaire')) color = 'red';
                                    
                                    finalRisks.push({ name: riskName, scope: "Commune", colorCode: color, severity: sev });
                                });
                            }
                            
-                           // Risques parent (libelle global) s'ils n'ont pas de détails
                            if (item.libelle_risque_long && (!item.risques_detail || item.risques_detail.length === 0)) {
                                const riskName = item.libelle_risque_long;
                                if (!seenRisks.has(riskName.toLowerCase())) {
@@ -494,11 +544,10 @@
                    }
                } catch(e) {}
 
-               // ── PPR (Plans de Prévention des Risques — très riche) ──
+               // ── PPR ──
                try {
                    const dataPpr = resPpr.status === 'fulfilled' ? resPpr.value : null;
                    if (dataPpr?.data?.length > 0) {
-                       // Extraire les types de risques couverts par les PPR
                        const pprTypes = new Map();
                        dataPpr.data.forEach(ppr => {
                            const etat = ppr.etat?.libelle_etat || '';
@@ -516,7 +565,6 @@
                        
                        if (pprTypes.size > 0) {
                            pprTypes.forEach(({ pprName, etat }, riskName) => {
-                               // Eviter les doublons avec GASPAR
                                const rnLow = riskName.toLowerCase();
                                const alreadyExists = finalRisks.some(r => r.name.toLowerCase() === rnLow);
                                if (!alreadyExists) {
@@ -545,7 +593,7 @@
                    }
                } catch(e) {}
 
-               // ── CATASTROPHES NATURELLES (CATNAT) ──
+               // ── CATASTROPHES NATURELLES ──
                let catnatCount = 0;
                try {
                    const dataCatnat = resCatnat.status === 'fulfilled' ? resCatnat.value : null;
@@ -555,18 +603,21 @@
                    }
                } catch(e) {}
 
-               // ── PRESCRIPTIONS D'URBANISME (GPU) ──
+               // ── PRESCRIPTIONS ──
                let prescriptions = [];
                try {
                    const dataPres = resPrescriptions.status === 'fulfilled' ? resPrescriptions.value : null;
                    if (dataPres?.features?.length > 0) {
-                       // Prescriptions pertinentes à garder
                        const keepKeywords = ['hauteur', 'aspect', 'emprise', 'cos', 'recul', 'alignement', 'retrait', 'densit', 'stationnement'];
                        prescriptions = dataPres.features.map(f => {
                            const p = f.properties || {};
+                           let val = p.txt || '';
+                           // Si le texte est vide, on regarde s'il y a un lien PDF, sinon on met le message générique
+                           if (!val || val.trim() === '') val = p.urlfic ? '📄 Lien PDF' : 'Voir règlement';
                            return {
                                libelle: p.libelle || 'Prescription',
-                               valeur: p.txt || '',
+                               valeur: val,
+                               url: p.urlfic || null,
                                type: p.typepsc || '',
                            };
                        }).filter(p => {
@@ -576,14 +627,13 @@
                    }
                } catch(e) {}
 
-               // ── SERVITUDES D'UTILITÉ PUBLIQUE (GPU) ──
+               // ── SERVITUDES ──
                let servitudes = [];
                try {
                    const dataSup = resServitudes.status === 'fulfilled' ? resServitudes.value : null;
                    if (dataSup?.features?.length > 0) {
                        servitudes = dataSup.features.map(f => {
                            const p = f.properties || {};
-                           // Rendre le nom lisible : PM1_PPRn_Lez_Mosson_ass → PPRn Lez Mosson
                            let nom = p.nomass || p.libelle || 'Servitude';
                            nom = nom.replace(/^[A-Z0-9]+_/, '').replace(/_ass$/, '').replace(/_/g, ' ');
                            return {
@@ -595,14 +645,14 @@
                    }
                } catch(e) {}
 
-               // ── INFOS COMMUNE (API Géo) ──
+               // ── INFOS COMMUNE ──
                let communeInfo = null;
                try {
                    const dataCommune = resCommune.status === 'fulfilled' ? resCommune.value : null;
                    if (dataCommune) {
                        communeInfo = {
                            population: dataCommune.population || null,
-                           surface: dataCommune.surface ? (dataCommune.surface / 100).toFixed(0) : null, // hectares → km²
+                           surface: dataCommune.surface ? (dataCommune.surface / 100).toFixed(0) : null,
                            codePostal: dataCommune.codesPostaux?.[0] || '',
                            departement: dataCommune.departement?.nom || '',
                            region: dataCommune.region?.nom || '',
@@ -610,7 +660,7 @@
                    }
                } catch(e) {}
 
-               // ── ALTITUDE (IGN) ──
+               // ── ALTITUDE ──
                let altitude = null;
                try {
                    const dataAlti = resAlti.status === 'fulfilled' ? resAlti.value : null;
@@ -619,15 +669,17 @@
                    }
                } catch(e) {}
 
-               // ── ÉCOLES (Éducation Nationale) ──
+               // ── ÉCOLES ──
                let ecoles = [];
                try {
                    const dataEcoles = resEcoles.status === 'fulfilled' ? resEcoles.value : null;
                    if (dataEcoles && dataEcoles.results) {
                        dataEcoles.results.forEach(ec => {
-                           if (!ec.latitude || !ec.longitude || String(ec.etat_etablissement) !== '1') return; // Uniquement écoles ouvertes
-                           const eLat = ec.latitude; const eLon = ec.longitude;
+                           const eLat = ec.latitude || (ec.position && ec.position.lat) || (ec.position && ec.position.y);
+                           const eLon = ec.longitude || (ec.position && ec.position.lon) || (ec.position && ec.position.x);
+                           if (!eLat || !eLon || String(ec.etat_etablissement) !== '1') return; 
                            const dLat = (eLat - lat) * Math.PI / 180; const dLon = (eLon - lon) * Math.PI / 180;
+                           const a2 = Math.sin(dLat/2)**2 + Math.cos(lat*Math.PI/180)*Math.cos(eLat*Math.PI/180)*Math.sin(dLon/2)**2;
                            const distM = Math.round(6371000 * 2 * Math.atan2(Math.sqrt(a2), Math.sqrt(1-a2)));
                            ecoles.push({ nom: ec.nom_etablissement, type: ec.type_etablissement, public_prive: ec.statut_public_prive, dist: distM });
                        });
@@ -635,39 +687,24 @@
                    }
                } catch(e) {}
 
-               // ── DPE (ADEME) ──
+               // ── DPE ──
                let dpe = [];
                try {
                    const dataDpe = resDpe.status === 'fulfilled' ? resDpe.value : null;
                    if (dataDpe && dataDpe.results) {
                        dpe = dataDpe.results.map(d => ({
-                           etiquette: d.etiquette_dpe || 'NC',
-                           ges: d.etiquette_ges || 'NC',
-                           conso: d.consommation_energie ? Math.round(d.consommation_energie) : null,
+                           etiquette: d.classe_bilan_dpe || d.etiquette_dpe || 'NC',
+                           ges: d.classe_emission_ges || d.etiquette_ges || 'NC',
+                           conso: d.consommation_energie_primaire_ep_m2 || d.consommation_energie ? Math.round(d.consommation_energie_primaire_ep_m2 || d.consommation_energie) : null,
                            annee: d.annee_construction || null,
                            type: d.tr001_modele_dpe_type_libelle || d.tr002_type_batiment_libelle || 'Bâtiment',
-                           surface: d.surface_habitable_logement ? Math.round(d.surface_habitable_logement) : null
+                           surface: d.surface_habitable_logement ? Math.round(d.surface_habitable_logement) : null,
+                           isNeuf: false
                        }));
                    }
                } catch(e) {}
 
-               // ── POLLUTION INDUSTRIELLE (ICPE / BASIAS) ──
-               try {
-                   const dataIcpe = resIcpe.status === 'fulfilled' ? resIcpe.value : null;
-                   const icpeCount = dataIcpe?.data?.length || 0;
-                   if (icpeCount > 0) {
-                       finalRisks.push({ name: "Installations classées (ICPE)", scope: "1 km", colorCode: 'yellow', severity: `${icpeCount} installation(s) proche(s)` });
-                   }
-               } catch(e) {}
-               try {
-                   const dataBasias = resBasias.status === 'fulfilled' ? resBasias.value : null;
-                   const basiasCount = dataBasias?.data?.length || 0;
-                   if (basiasCount > 0) {
-                       finalRisks.push({ name: "Anciens sites industriels (Sols)", scope: "1 km", colorCode: 'yellow', severity: `${basiasCount} site(s) recensé(s)` });
-                   }
-               } catch(e) {}
-
-               // ── PERMIS DE CONSTRUIRE (SITADEL) ──
+               // ── PERMIS DE CONSTRUIRE ──
                let permis = [];
                let sitadelError = false;
                try {
@@ -687,21 +724,48 @@
                    }
                } catch(e) { sitadelError = true; }
 
-               // ── COMMODITÉS DE QUARTIER (OpenStreetMap) ──
-               let commodites = { alimentation: 0, sante: 0, transport: 0 };
+               // ── COMMODITÉS & ÉCOLES (OpenStreetMap) ──
+               let commodites = { alimentation: [], sante: [], transport: [] };
+               ecoles = []; // On écrase l'ancienne liste vide
                try {
                    const dataOsm = resOverpass.status === 'fulfilled' ? resOverpass.value : null;
                    if (dataOsm && dataOsm.elements) {
                        dataOsm.elements.forEach(el => {
                            const tags = el.tags || {};
-                           if (tags.shop) commodites.alimentation++;
-                           else if (tags.amenity) commodites.sante++;
-                           else if (tags.highway === 'bus_stop' || tags.public_transport === 'station') commodites.transport++;
+                           let cLat = el.lat || (el.center && el.center.lat);
+                           let cLon = el.lon || (el.center && el.center.lon);
+                           if (!cLat || !cLon) return;
+
+                           const dLat = (cLat - lat) * Math.PI / 180; const dLon = (cLon - lon) * Math.PI / 180;
+                           const a2 = Math.sin(dLat/2)**2 + Math.cos(lat*Math.PI/180)*Math.cos(cLat*Math.PI/180)*Math.sin(dLon/2)**2;
+                           const distM = Math.round(6371000 * 2 * Math.atan2(Math.sqrt(a2), Math.sqrt(1-a2)));
+
+                           let name = tags.name || tags.brand || tags.operator || 'Inconnu';
+                           if (tags.shop) {
+                               commodites.alimentation.push({ nom: name, type: tags.shop === 'bakery' ? 'Boulangerie' : 'Supermarché/Commerce', dist: distM, lat: cLat, lon: cLon });
+                           } else if (tags.highway === 'bus_stop' || tags.public_transport === 'station') {
+                               if (name === 'Inconnu' && tags.ref) name = 'Ligne ' + tags.ref;
+                               commodites.transport.push({ nom: name, type: tags.highway === 'bus_stop' ? 'Arrêt de bus' : 'Station', dist: distM, lat: cLat, lon: cLon });
+                           } else if (tags.amenity) {
+                               if (tags.amenity.match(/school|kindergarten|college|university/)) {
+                                   let type = 'École';
+                                   if (tags.amenity === 'kindergarten') type = 'Maternelle';
+                                   if (tags.amenity === 'college' || name.toLowerCase().includes('collège')) type = 'Collège';
+                                   if (tags.amenity === 'university' || name.toLowerCase().includes('lycée')) type = 'Lycée / Supérieur';
+                                   ecoles.push({ nom: name, type: type, dist: distM, lat: cLat, lon: cLon });
+                               } else {
+                                   commodites.sante.push({ nom: name, type: tags.amenity === 'pharmacy' ? 'Pharmacie' : 'Centre Médical', dist: distM, lat: cLat, lon: cLon });
+                               }
+                           }
                        });
+                       commodites.alimentation.sort((a,b)=>a.dist - b.dist);
+                       commodites.sante.sort((a,b)=>a.dist - b.dist);
+                       commodites.transport.sort((a,b)=>a.dist - b.dist);
+                       ecoles.sort((a,b)=>a.dist - b.dist);
                    }
                } catch(e) {}
 
-               // ── HISTORIQUE DVF (Ventes) ──
+                              // ── HISTORIQUE DVF (Ventes) ──
                let dvfData = [];
                let prixMoyenM2 = null;
                let prixMedianM2 = null;
@@ -839,7 +903,9 @@
                    const prixM2List = dvfData.filter(d => {
                        const v = d.valeur;
                        const s = parseFloat(cleanVal(d.surface_reelle_bati)) || parseFloat(cleanVal(d.surface_terrain));
-                       return v && v > 0 && s && s > 0;
+                       if (!v || v <= 0 || !s || s < 9) return false; // Ignorer < 9m² (caves, parkings)
+                       const pm2 = v / s;
+                       return pm2 >= 500 && pm2 <= 50000; // Filtrer les anomalies aberrantes
                    }).map(d => {
                        const s = parseFloat(cleanVal(d.surface_reelle_bati)) || parseFloat(cleanVal(d.surface_terrain));
                        return d.valeur / s;
@@ -868,9 +934,9 @@
                
                const parcelDataFinal = {
                   num, section, area: parcel.properties.contenance, city: cityname, citycode: citycode, lon: lon, lat: lat, 
-                  address: parcelAddress,
+                  address: parcelAddress, streetName: streetName,
                   risks: finalRisks, dvf: dvfData, zoning: zoning, isLoading: false, reportUrl: parcelReportUrl,
-                  prescriptions, servitudes, communeInfo, prixMoyenM2, prixMedianM2, reglementUrl, altitude, ecoles, dpe, permis, sitadelError, commodites
+                  prescriptions, servitudes, communeInfo, prixMoyenM2, prixMedianM2, reglementUrl, altitude, ecoles, dpe, permis, sitadelError, commodites, sitadelLoading: true
                };
                setActiveParcelData(parcelDataFinal);
                // Stocker les données dans le polygon pour pouvoir les restaurer au clic sidebar
@@ -880,6 +946,38 @@
                        return [...prev.slice(0, -1), { ...last, parcelData: parcelDataFinal }];
                    }
                    return prev;
+               });
+
+               // ── Lancement SITADEL en arrière-plan ──
+               const sitadelUrl = `https://data.statistiques.developpement-durable.gouv.fr/api/explore/v2.1/catalog/datasets/sitadel-logements-autorises-commences/records?limit=100&where=code_commune%3D%22${citycode}%22`;
+               fetchWithTimeout(sitadelUrl, 8000)
+               .then(async (res) => {
+                   if (res.ok) {
+                       const data = await res.json();
+                       const streetLower = (streetName || '').toLowerCase();
+                       let permisBg = (data.results || []).map(p => {
+                           return {
+                               date: p.date_autorisation || p.date_depot || 'Date NC',
+                               nature: p.nature_projet || 'Construction',
+                               surface: p.surface_creee || 0,
+                               logements: p.nombre_logements || 0,
+                               etat: p.etat_dossier || 'Autorisé',
+                               adresse: (p.adresse_terrain || '').toLowerCase()
+                           };
+                       }).filter(p => p.surface > 0 || p.logements > 0);
+                       
+                       // Si on a un nom de rue, on filtre localement
+                       if (streetLower.length > 3) {
+                           const filtered = permisBg.filter(p => p.adresse.includes(streetLower));
+                           if (filtered.length > 0) permisBg = filtered;
+                       }
+                       
+                       setActiveParcelData(prev => prev && prev.num === num ? { ...prev, permis: permisBg.slice(0, 15), sitadelLoading: false, sitadelError: false } : prev);
+                   } else {
+                       setActiveParcelData(prev => prev && prev.num === num ? { ...prev, sitadelLoading: false, sitadelError: true } : prev);
+                   }
+               }).catch(() => {
+                   setActiveParcelData(prev => prev && prev.num === num ? { ...prev, sitadelLoading: false, sitadelError: true } : prev);
                });
             } catch(e) {
                console.error(e);
@@ -1219,13 +1317,15 @@
           }
         });
 
-        // Lignes DVF (relient parcelle sélectionnée aux parcelles vendues)
+        // Lignes de liaison (DVF ou Commodités)
         if (dvfLinks.length > 0) {
           dvfLinks.forEach(link => {
             const fromPx = geoToPx(link.from.x, link.from.y, viewport);
             const toPx = geoToPx(link.to.x, link.to.y, viewport);
-            // Trait rouge continu épais
-            ctx.strokeStyle = '#ef4444';
+            const lineColor = link.color || '#ef4444'; // Utilise la couleur donnée, sinon rouge par défaut
+            
+            // Trait continu épais
+            ctx.strokeStyle = lineColor;
             ctx.lineWidth = 3;
             ctx.beginPath();
             ctx.moveTo(fromPx.x, fromPx.y);
@@ -1233,7 +1333,7 @@
             ctx.stroke();
             // Cercles aux extrémités
             [fromPx, toPx].forEach(pt => {
-              ctx.fillStyle = '#ef4444';
+              ctx.fillStyle = lineColor;
               ctx.beginPath(); ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2); ctx.fill();
               ctx.fillStyle = 'white';
               ctx.beginPath(); ctx.arc(pt.x, pt.y, 3, 0, Math.PI * 2); ctx.fill();
@@ -1252,13 +1352,13 @@
             const bw = tw + 14, bh = 22;
             // Bulle fond blanc
             ctx.fillStyle = 'white';
-            ctx.strokeStyle = '#ef4444';
+            ctx.strokeStyle = lineColor;
             ctx.lineWidth = 2;
             ctx.beginPath();
             ctx.roundRect(midX - bw/2, midY - bh/2, bw, bh, 6);
             ctx.fill(); ctx.stroke();
-            // Texte rouge dans la bulle
-            ctx.fillStyle = '#ef4444';
+            // Texte coloré dans la bulle
+            ctx.fillStyle = lineColor;
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
             ctx.fillText(distText, midX, midY);
           });
@@ -1530,8 +1630,8 @@
             
             const sharedId = uid(); // ID commun pour le tracé et le calque
             
-            // Dessiner la ligne
-            setDvfLinks(prev => [...prev, { id: sharedId, from: { x: originX, y: originY }, to: { x: targetX, y: targetY } }]);
+            // Dessiner la ligne (Rouge pour les ventes)
+            setDvfLinks(prev => [...prev, { id: sharedId, from: { x: originX, y: originY }, to: { x: targetX, y: targetY }, color: '#ef4444' }]);
             
             // Calculer la distance exacte (Haversine) entre les deux centres
             const dLat2 = (cLat - activeParcelDataRef.current?.lat) * Math.PI / 180;
@@ -2218,12 +2318,14 @@
                   <div className={`w-12 h-1.5 rounded-full ${darkMode ? 'bg-slate-500' : 'bg-slate-300'}`}></div>
                 </div>
                        <div className="flex justify-between items-center mb-3">
-                           <div className="flex flex-1 rounded-lg overflow-x-auto custom-scrollbar mobile-no-scrollbar border" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>                           {[
+                           <div className="flex flex-1 rounded-lg overflow-x-auto custom-scrollbar mobile-no-scrollbar border" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>                           
+                  {[
                                { id: 'synthese', label: 'Synthèse' },
+                               { id: 'dvf', label: 'DVF' },
+                               { id: 'marche', label: 'Marché' },
+                               { id: 'quartier', label: 'Commodités' },
                                { id: 'urba', label: 'Bâti' },
                                { id: 'diag', label: 'Risques' },
-                               { id: 'quartier', label: 'Quartier' },
-                               { id: 'marche', label: 'Marché' },
                            ].map(tab => (
                                <button key={tab.id} onClick={() => setActivePanelTab(tab.id)} className={`shrink-0 whitespace-nowrap px-3 py-1.5 text-[9px] font-bold uppercase tracking-wider transition-colors ${activePanelTab === tab.id ? (darkMode ? 'bg-emerald-600 text-white' : 'bg-emerald-600 text-white') : (darkMode ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-white text-slate-500 hover:bg-slate-50')}`}>
                                    {tab.label}
@@ -2400,58 +2502,128 @@
                          {/* ONGLET QUARTIER */}
                          {activePanelTab === 'quartier' && (
                            <div className="pb-4 space-y-3">
-                               {/* SECTION COMMODITÉS */}
-                               <div className="mb-3">
-                                   <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Commodités (Rayon 1.5 km)</div>
-                                   <div className="grid grid-cols-3 gap-2">
-                                       <div className={`p-2 rounded-lg border flex flex-col items-center justify-center text-center ${darkMode ? 'bg-orange-900/20 border-orange-800/50' : 'bg-orange-50 border-orange-200'}`}>
-                                           <span className="text-lg mb-1">🥖</span>
-                                           <span className={`text-[11px] font-bold ${darkMode ? 'text-orange-400' : 'text-orange-700'}`}>{activeParcelData.commodites?.alimentation || 0}</span>
-                                           <span className={`text-[8px] ${theme.textMuted}`}>Commerces</span>
-                                       </div>
-                                       <div className={`p-2 rounded-lg border flex flex-col items-center justify-center text-center ${darkMode ? 'bg-blue-900/20 border-blue-800/50' : 'bg-blue-50 border-blue-200'}`}>
-                                           <span className="text-lg mb-1">🩺</span>
-                                           <span className={`text-[11px] font-bold ${darkMode ? 'text-blue-400' : 'text-blue-700'}`}>{activeParcelData.commodites?.sante || 0}</span>
-                                           <span className={`text-[8px] ${theme.textMuted}`}>Santé</span>
-                                       </div>
-                                       <div className={`p-2 rounded-lg border flex flex-col items-center justify-center text-center ${darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-100 border-slate-300'}`}>
-                                           <span className="text-lg mb-1">🚌</span>
-                                           <span className={`text-[11px] font-bold ${theme.textTitle}`}>{activeParcelData.commodites?.transport || 0}</span>
-                                           <span className={`text-[8px] ${theme.textMuted}`}>Transports</span>
-                                       </div>
-                                   </div>
-                               </div>
-                               {activeParcelData.ecoles && activeParcelData.ecoles.length > 0 ? (
-                                   <div>
-                                       <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Écoles à proximité ({activeParcelData.ecoles.length})</div>
-                                       <div className="space-y-1.5 max-h-[350px] overflow-y-auto custom-scrollbar pr-1">
-                                           {activeParcelData.ecoles.map((ecole, idx) => {
-                                               let colorClass = darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200';
-                                               let badgeClass = darkMode ? 'bg-slate-700 text-slate-300' : 'bg-slate-200 text-slate-700';
-                                               if (ecole.type.includes('Maternelle')) { colorClass = darkMode ? 'bg-pink-900/10 border-pink-800/30' : 'bg-pink-50/50 border-pink-100'; badgeClass = darkMode ? 'bg-pink-900/50 text-pink-300' : 'bg-pink-100 text-pink-700'; }
-                                               else if (ecole.type.includes('Elémentaire') || ecole.type.includes('Primaire')) { colorClass = darkMode ? 'bg-amber-900/10 border-amber-800/30' : 'bg-amber-50/50 border-amber-100'; badgeClass = darkMode ? 'bg-amber-900/50 text-amber-300' : 'bg-amber-100 text-amber-700'; }
-                                               else if (ecole.type.includes('Collège')) { colorClass = darkMode ? 'bg-sky-900/10 border-sky-800/30' : 'bg-sky-50/50 border-sky-100'; badgeClass = darkMode ? 'bg-sky-900/50 text-sky-300' : 'bg-sky-100 text-sky-700'; }
-                                               else if (ecole.type.includes('Lycée')) { colorClass = darkMode ? 'bg-indigo-900/10 border-indigo-800/30' : 'bg-indigo-50/50 border-indigo-100'; badgeClass = darkMode ? 'bg-indigo-900/50 text-indigo-300' : 'bg-indigo-100 text-indigo-700'; }
-
-                                               return (
-                                                   <div key={idx} className={`p-2 rounded-lg border flex flex-col ${colorClass}`}>
-                                                       <div className="flex justify-between items-start gap-2 mb-1">
-                                                           <span className={`text-[10px] font-bold ${theme.textTitle} leading-tight`}>{ecole.nom}</span>
-                                                           <span className={`text-[9px] font-bold ${darkMode ? 'text-emerald-400' : 'text-emerald-600'} whitespace-nowrap`}>{ecole.dist} m</span>
-                                                       </div>
-                                                       <div className="flex gap-1">
-                                                           <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded ${badgeClass}`}>{ecole.type}</span>
-                                                           <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded ${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-white text-slate-500 border border-slate-200'}`}>{ecole.public_prive}</span>
-                                                       </div>
-                                                   </div>
-                                               );
-                                           })}
-                                       </div>
-                                       <div className={`mt-2 pt-2 border-t text-[9px] text-center ${darkMode ? 'border-slate-700 text-slate-500' : 'border-slate-200 text-slate-400'}`}>Source : Ministère de l'Éducation Nationale (Rayon de 3 km)</div>
-                                   </div>
-                               ) : (
-                                   <div className={`text-[11px] font-medium p-3 text-center rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50 text-slate-400' : 'bg-slate-50 border-slate-200/50 text-slate-500'}`}>Aucune école recensée à moins de 3km.</div>
+                               
+                               {/* Bouton pour nettoyer la carte */}
+                               {dvfLinks.filter(l => l.color === '#3b82f6').length > 0 && (
+                                   <button onClick={() => setDvfLinks(prev => prev.filter(l => l.color !== '#3b82f6'))} className={`w-full mb-1 py-1.5 rounded-lg text-[9px] font-bold text-center transition-all ${darkMode ? 'bg-blue-900/30 text-blue-400 border border-blue-800/50 hover:bg-blue-900/50' : 'bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100'}`}>
+                                       Effacer les tracés ({dvfLinks.filter(l => l.color === '#3b82f6').length})
+                                   </button>
                                )}
+
+                               <div className="mb-3">
+                                   <div className={`flex justify-between items-center mb-2`}>
+                                       <div className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Points d'intérêt (Rayon 1.5 km)</div>
+                                       <button onClick={handleReloadOsm} disabled={activeParcelData.osmLoading} className={`flex items-center gap-1.5 px-2 py-1.5 rounded border transition-colors ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'} ${activeParcelData.osmLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                                           <svg className={`w-3.5 h-3.5 ${activeParcelData.osmLoading ? 'animate-spin text-indigo-500' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                           <span className="text-[9px] font-bold uppercase tracking-wider">{activeParcelData.osmLoading ? 'Recherche...' : 'Actualiser'}</span>
+                                       </button>
+                                   </div>
+                                   
+                                   <div className="flex rounded-lg overflow-hidden border mb-2" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>
+                                       <button onClick={() => { setActiveCommoTab('alimentation'); setCommoLimit(10); setPoiSearch(''); }} className={`flex-1 py-1.5 flex flex-col items-center transition-colors ${activeCommoTab === 'alimentation' ? (darkMode ? 'bg-orange-900/40 text-orange-400' : 'bg-orange-50 text-orange-700') : (darkMode ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-white text-slate-500 hover:bg-slate-50')}`}>
+                                           <span className="text-[8px] font-bold uppercase tracking-wider mb-0.5 truncate w-full text-center px-1">Commerces</span>
+                                           <span className="text-sm font-black">{activeParcelData.commodites?.alimentation?.length || 0}</span>
+                                       </button>
+                                       <button onClick={() => { setActiveCommoTab('sante'); setCommoLimit(10); setPoiSearch(''); }} className={`flex-1 py-1.5 flex flex-col items-center transition-colors border-l ${darkMode ? 'border-slate-700' : 'border-slate-200'} ${activeCommoTab === 'sante' ? (darkMode ? 'bg-blue-900/40 text-blue-400' : 'bg-blue-50 text-blue-700') : (darkMode ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-white text-slate-500 hover:bg-slate-50')}`}>
+                                           <span className="text-[8px] font-bold uppercase tracking-wider mb-0.5 truncate w-full text-center px-1">Santé</span>
+                                           <span className="text-sm font-black">{activeParcelData.commodites?.sante?.length || 0}</span>
+                                       </button>
+                                       <button onClick={() => { setActiveCommoTab('transport'); setCommoLimit(10); setPoiSearch(''); }} className={`flex-1 py-1.5 flex flex-col items-center transition-colors border-l ${darkMode ? 'border-slate-700' : 'border-slate-200'} ${activeCommoTab === 'transport' ? (darkMode ? 'bg-slate-700 text-white' : 'bg-slate-100 text-slate-800') : (darkMode ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-white text-slate-500 hover:bg-slate-50')}`}>
+                                           <span className="text-[8px] font-bold uppercase tracking-wider mb-0.5 truncate w-full text-center px-1">Transports</span>
+                                           <span className="text-sm font-black">{activeParcelData.commodites?.transport?.length || 0}</span>
+                                       </button>
+                                       <button onClick={() => { setActiveCommoTab('ecoles'); setCommoLimit(10); setPoiSearch(''); }} className={`flex-1 py-1.5 flex flex-col items-center transition-colors border-l ${darkMode ? 'border-slate-700' : 'border-slate-200'} ${activeCommoTab === 'ecoles' ? (darkMode ? 'bg-indigo-900/40 text-indigo-400' : 'bg-indigo-50 text-indigo-700') : (darkMode ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-white text-slate-500 hover:bg-slate-50')}`}>
+                                           <span className="text-[8px] font-bold uppercase tracking-wider mb-0.5 truncate w-full text-center px-1">Écoles</span>
+                                           <span className="text-sm font-black">{activeParcelData.ecoles?.length || 0}</span>
+                                       </button>
+                                   </div>
+
+                                   {/* Barre de recherche POI */}
+                                   <div className="relative mb-2">
+                                       <svg className={`w-3.5 h-3.5 absolute left-2.5 top-2 ${theme.textMuted}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                                       <input type="text" placeholder={`Filtrer dans la catégorie...`} value={poiSearch} onChange={(e) => { setPoiSearch(e.target.value); setCommoLimit(10); }} className={`w-full pl-8 pr-2 py-1.5 text-[10px] border rounded-lg outline-none transition-colors ${theme.input}`} />
+                                   </div>
+
+                                   {(() => {
+                                       let currentList = activeCommoTab === 'ecoles' ? activeParcelData.ecoles : activeParcelData.commodites?.[activeCommoTab];
+                                       
+                                       if (currentList && poiSearch) {
+                                           const s = poiSearch.toLowerCase();
+                                           currentList = currentList.filter(item => item.nom.toLowerCase().includes(s) || item.type.toLowerCase().includes(s));
+                                       }
+
+                                       if (currentList && currentList.length > 0) {
+                                           const visibleList = currentList.slice(0, commoLimit);
+                                           const hasMore = currentList.length > commoLimit;
+                                           
+                                           return (
+                                               <div className="space-y-1.5">
+                                                   {visibleList.map((item, idx) => {
+                                                       let colorClass = darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200';
+                                                       let badgeClass = darkMode ? 'bg-slate-700 text-slate-300' : 'bg-slate-200 text-slate-700';
+                                                       
+                                                       if (activeCommoTab === 'alimentation') colorClass = darkMode ? 'bg-orange-900/10 border-orange-800/30' : 'bg-orange-50/50 border-orange-100';
+                                                       else if (activeCommoTab === 'sante') colorClass = darkMode ? 'bg-blue-900/10 border-blue-800/30' : 'bg-blue-50/50 border-blue-100';
+                                                       else if (activeCommoTab === 'transport') colorClass = darkMode ? 'bg-slate-800/30 border-slate-700/50' : 'bg-slate-100/50 border-slate-200';
+                                                       else if (activeCommoTab === 'ecoles') {
+                                                           if (item.type.includes('Maternelle')) { colorClass = darkMode ? 'bg-pink-900/10 border-pink-800/30' : 'bg-pink-50/50 border-pink-100'; badgeClass = darkMode ? 'bg-pink-900/50 text-pink-300' : 'bg-pink-100 text-pink-700'; }
+                                                           else if (item.type.includes('Elémentaire') || item.type.includes('Primaire')) { colorClass = darkMode ? 'bg-amber-900/10 border-amber-800/30' : 'bg-amber-50/50 border-amber-100'; badgeClass = darkMode ? 'bg-amber-900/50 text-amber-300' : 'bg-amber-100 text-amber-700'; }
+                                                           else if (item.type.includes('Collège')) { colorClass = darkMode ? 'bg-sky-900/10 border-sky-800/30' : 'bg-sky-50/50 border-sky-100'; badgeClass = darkMode ? 'bg-sky-900/50 text-sky-300' : 'bg-sky-100 text-sky-700'; }
+                                                           else if (item.type.includes('Lycée')) { colorClass = darkMode ? 'bg-indigo-900/10 border-indigo-800/30' : 'bg-indigo-50/50 border-indigo-100'; badgeClass = darkMode ? 'bg-indigo-900/50 text-indigo-300' : 'bg-indigo-100 text-indigo-700'; }
+                                                       }
+
+                                                       return (
+                                                           <div key={idx} 
+                                                                onClick={() => {
+                                                                    if (!item.lat || !item.lon) return;
+                                                                    const oX = (activeParcelData.lon * Math.PI / 180) * R;
+                                                                    const oY = Math.log(Math.tan(Math.PI / 4 + (activeParcelData.lat * Math.PI / 180) / 2)) * R;
+                                                                    const tX = (item.lon * Math.PI / 180) * R;
+                                                                    const tY = Math.log(Math.tan(Math.PI / 4 + (item.lat * Math.PI / 180) / 2)) * R;
+                                                                    const sharedId = 'poi_'+activeCommoTab+'_'+idx+'_'+Date.now();
+                                                                    setDvfLinks(prev => [...prev, { id: sharedId, from: {x: oX, y: oY}, to: {x: tX, y: tY}, color: '#3b82f6' }]);
+                                                                    
+                                                                    const allX = [oX, tX]; const allY = [oY, tY];
+                                                                    const minX = Math.min(...allX) - 50; const maxX = Math.max(...allX) + 50;
+                                                                    const minY = Math.min(...allY) - 50; const maxY = Math.max(...allY) + 50;
+                                                                    const newRes = Math.max((maxX - minX) / (viewport.width * 0.6), (maxY - minY) / (viewport.height * 0.6), 0.3);
+                                                                    animateViewport({ x: (minX+maxX)/2, y: (minY+maxY)/2 }, newRes);
+                                                                    
+                                                                    if (window.innerWidth < 768) setPanelHeight(5);
+                                                                }}
+                                                                className={`px-2 py-1.5 rounded-lg border flex items-center justify-between cursor-pointer hover:ring-1 hover:ring-blue-400/50 transition-all ${colorClass}`}>
+                                                               <div className="flex items-center gap-2 min-w-0">
+                                                                   <div className="flex flex-col min-w-0">
+                                                                       <span className={`text-[9px] font-bold truncate ${theme.textTitle}`}>{item.nom}</span>
+                                                                       {activeCommoTab === 'ecoles' ? (
+                                                                           <div className="mt-0.5"><span className={`text-[7px] font-bold px-1.5 py-0.5 rounded ${badgeClass}`}>{item.type}</span></div>
+                                                                       ) : (
+                                                                           <span className={`text-[8px] ${theme.textMuted}`}>{item.type}</span>
+                                                                       )}
+                                                                   </div>
+                                                               </div>
+                                                               <span className={`text-[9px] font-bold whitespace-nowrap ${darkMode ? 'text-emerald-400' : 'text-emerald-600'}`}>{item.dist} m</span>
+                                                           </div>
+                                                       );
+                                                   })}
+                                                   {hasMore && (
+                                                       <button onClick={() => setCommoLimit(prev => prev + 10)} className={`w-full py-1.5 mt-2 rounded-lg text-[9px] font-bold uppercase tracking-wider border transition-colors ${darkMode ? 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700' : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'}`}>
+                                                           Voir plus ({currentList.length - commoLimit} restants)
+                                                       </button>
+                                                   )}
+                                               </div>
+                                           );
+                                       } else {
+                                           return (
+                                               <div className={`text-[9px] text-center p-3 rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50 text-slate-500' : 'bg-slate-50 border-slate-200 text-slate-400'}`}>
+                                                   Aucun résultat recensé à moins de 1.5 km.
+                                               </div>
+                                           );
+                                       }
+                                   })()}
+                               </div>
+                               
+                               <div className={`mt-2 pt-2 border-t text-[9px] text-center ${darkMode ? 'border-slate-700 text-slate-500' : 'border-slate-200 text-slate-400'}`}>Source : OpenStreetMap (Rayon de 1.5 km)</div>
                            </div>
                          )}
 
@@ -2511,7 +2683,10 @@
                                                return (
                                                    <div key={idx} className={`p-2 rounded-lg border flex flex-col gap-1.5 ${darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
                                                        <div className="flex items-center justify-between">
-                                                           <span className={`text-[10px] font-bold ${theme.textTitle}`}>{diag.type} {diag.surface ? `(${diag.surface} m²)` : ''}</span>
+                                                           <div className="flex items-center gap-1.5">
+                                                               <span className={`text-[10px] font-bold ${theme.textTitle}`}>{diag.type} {diag.surface ? `(${diag.surface} m²)` : ''}</span>
+                                                               {diag.isNeuf && <span className={`px-1 py-0.5 rounded text-[7px] font-bold uppercase ${darkMode ? 'bg-sky-900/50 text-sky-300' : 'bg-sky-100 text-sky-700'}`}>Neuf</span>}
+                                                           </div>
                                                            <div className="flex gap-1">
                                                                <span className={`flex items-center justify-center w-6 h-6 rounded text-white font-bold text-[11px] ${getDpeColor(diag.etiquette)}`} title={`Énergie: ${diag.etiquette}`}>
                                                                    {diag.etiquette}
@@ -2541,17 +2716,18 @@
                                    <div className="mb-3">
                                        <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Prescriptions d'urbanisme ({activeParcelData.prescriptions.length})</div>
                                        <div className="space-y-1.5">
-                                           {activeParcelData.prescriptions.map((p, idx) => {
-                                               const isReadable = p.valeur && p.valeur.length < 20 && !p.valeur.match(/^[a-z]{5,}$/i);
-                                               return (
+                                           {activeParcelData.prescriptions.map((p, idx) => (
                                                <div key={idx} className={`p-2 rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
-                                                   <div className="flex justify-between items-start gap-2">
+                                                   <div className="flex justify-between items-center gap-2">
                                                        <span className={`text-[10px] font-semibold ${theme.textTitle}`}>{p.libelle}</span>
-                                                       {isReadable && <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded whitespace-nowrap ${darkMode ? 'bg-indigo-900/50 text-indigo-400 border border-indigo-800' : 'bg-indigo-50 text-indigo-700 border border-indigo-200'}`}>{p.valeur}</span>}
+                                                       {p.url ? (
+                                                           <a href={p.url} target="_blank" rel="noreferrer" className={`text-[9px] font-bold px-1.5 py-0.5 rounded whitespace-nowrap hover:scale-105 transition-transform ${darkMode ? 'bg-sky-900/50 text-sky-400 border border-sky-800' : 'bg-sky-50 text-sky-700 border border-sky-200'}`}>{p.valeur}</a>
+                                                       ) : (
+                                                           <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded whitespace-nowrap ${p.valeur === 'Voir règlement' ? (darkMode ? 'bg-slate-700 text-slate-400 border border-slate-600' : 'bg-slate-100 text-slate-500 border border-slate-200') : (darkMode ? 'bg-indigo-900/50 text-indigo-400 border border-indigo-800' : 'bg-indigo-50 text-indigo-700 border border-indigo-200')}`}>{p.valeur}</span>
+                                                       )}
                                                    </div>
                                                </div>
-                                               );
-                                           })}
+                                           ))}
                                        </div>
                                    </div>
                                )}
@@ -2579,7 +2755,79 @@
                            </div>
                          )}
 
-                        {/* ONGLET MARCHÉ (Fusion DVF + Indicateurs) */}
+                        {/* ONGLET DVF (Historique des ventes) */}
+                         {activePanelTab === 'dvf' && (
+                           <div className="pb-4">
+                               {(() => {
+                                   const dvf = activeParcelData.dvf || [];
+                                   const clean = (v) => (v === null || v === undefined || v === 'None' || v === 'none' || v === 'nan' || v === 'NaN' || v === '') ? null : v;
+                                   return (
+                                       <>
+                                           <div className="flex items-center justify-between mb-2">
+                                               <div className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Historique des ventes ({dvf.length})</div>
+                                           </div>
+                                           {dvfLinks.length > 0 && (
+                                               <button onClick={() => { setDvfLinks([]); setPolygons(prev => prev.filter(p => !p.isDvfHighlight)); }} className={`w-full mb-2 py-1.5 rounded-lg text-[9px] font-bold text-center transition-all ${darkMode ? 'bg-red-900/30 text-red-400 border border-red-800/50 hover:bg-red-900/50' : 'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100'}`}>
+                                                   Effacer les localisations ({dvfLinks.length})
+                                               </button>
+                                           )}
+                                           {dvf.length > 0 ? (
+                                               <div className="space-y-2 max-h-[400px] overflow-y-auto pr-1 custom-scrollbar">
+                                                   {dvf.map((sale, idx) => {
+                                                       const saleDate = clean(sale.dateStr);
+                                                       const saleType = clean(sale.type_local);
+                                                       const saleSurfBati = clean(sale.surface_reelle_bati);
+                                                       const saleSurfTerrain = clean(sale.surface_terrain);
+                                                       const details = [sale.nature_mutation || 'Vente'];
+                                                       if (saleType) details.push(saleType);
+                                                       if (saleSurfBati && saleSurfBati !== '0' && saleSurfBati !== '0.0') details.push(`${parseFloat(saleSurfBati)} m² bâti`);
+                                                       if (saleSurfTerrain && saleSurfTerrain !== '0' && saleSurfTerrain !== '0.0') details.push(`${parseFloat(saleSurfTerrain)} m² terrain`);
+                                                       
+                                                       const surfM2 = parseFloat(saleSurfBati) || parseFloat(saleSurfTerrain) || 0;
+                                                       const salePrixM2 = (sale.valeur && surfM2 > 0) ? Math.round(sale.valeur / surfM2) : null;
+                                                       const canLocate = !sale.isExactParcel && sale.displayId && sale.displayId.length >= 10;
+                                                       
+                                                       return (
+                                                           <div key={idx} onClick={() => { if (canLocate) { locateDvfParcel(sale.displayId); if (window.innerWidth < 768) setPanelHeight(5); } }}
+                                                             className={`p-2.5 rounded-lg border transition-all ${canLocate ? 'cursor-pointer hover:ring-1 hover:ring-amber-400/50' : ''} ${
+                                                             sale.isExactParcel 
+                                                               ? (darkMode ? 'bg-indigo-950/60 border-indigo-500' : 'bg-indigo-50/80 border-indigo-400')
+                                                               : (darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200/50')
+                                                           }`}>
+                                                               <div className="flex justify-between items-start mb-1">
+                                                                   <div className="flex flex-col">
+                                                                       <div className="flex items-baseline gap-2">
+                                                                           <span className={`font-bold ${sale.isExactParcel ? 'text-base' : 'text-sm'} ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
+                                                                               {sale.valeur !== null ? new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(sale.valeur) : 'Prix NC'}
+                                                                           </span>
+                                                                           {salePrixM2 !== null && <span className={`text-[9px] font-bold ${darkMode ? 'text-emerald-400' : 'text-emerald-600'}`}>{salePrixM2 < 1 ? '<1' : salePrixM2.toLocaleString('fr-FR')} €/m²</span>}
+                                                                       </div>
+                                                                       {canLocate && <span className={`text-[8px] font-bold ${darkMode ? 'text-sky-400' : 'text-sky-600'}`}>{sale.distance > 0 ? `à ${sale.distance < 1000 ? sale.distance + 'm' : (sale.distance/1000).toFixed(1) + 'km'}` : 'Localiser'}</span>}
+                                                                   </div>
+                                                                   {saleDate && (
+                                                                     <span className={`text-[9px] font-medium px-1.5 py-0.5 rounded border ${darkMode ? 'bg-slate-800 text-slate-300 border-slate-600' : 'bg-white text-slate-700 border-slate-200'}`}>
+                                                                         {new Date(saleDate).toLocaleDateString('fr-FR')}
+                                                                     </span>
+                                                                   )}
+                                                               </div>
+                                                               <div className={`text-[9px] ${theme.textMuted}`}>{details.join(' • ')}</div>
+                                                           </div>
+                                                       );
+                                                   })}
+                                               </div>
+                                           ) : (
+                                               <div className={`text-[10px] p-3 text-center rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50 text-slate-400' : 'bg-slate-50 border-slate-200/50 text-slate-500'}`}>Aucune vente publique trouvée.</div>
+                                           )}
+                                           <div className="pt-2 mt-3 border-t flex flex-col gap-2" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>
+                                                <p className={`text-[9px] text-center ${theme.textMuted}`}>Données issues de la base DVF (DGFiP)</p>
+                                           </div>
+                                       </>
+                                   );
+                               })()}
+                           </div>
+                         )}
+
+                         {/* ONGLET MARCHÉ (Indicateurs & Simulateur) */}
                          {activePanelTab === 'marche' && (
                            <div className="pb-4">
                                {(() => {
@@ -2596,11 +2844,13 @@
                                    dvf.forEach(d => {
                                        if (!d.dateStr || !d.valeur) return;
                                        const s = parseFloat(clean(d.surface_reelle_bati)) || parseFloat(clean(d.surface_terrain));
-                                       if (!s || s <= 0) return;
+                                       if (!s || s < 9) return; // Ignorer < 9m²
+                                       const pm2 = d.valeur / s;
+                                       if (pm2 < 500 || pm2 > 50000) return; // Filtrer valeurs aberrantes
                                        const year = d.dateStr.substring(0, 4);
                                        const type = clean(d.type_local) || 'Terrain';
                                        if (!yearData[year]) yearData[year] = [];
-                                       yearData[year].push({ pm2: d.valeur / s, type });
+                                       yearData[year].push({ pm2, type });
                                    });
                                    const years = Object.keys(yearData).sort();
                                    const yearAvg = years.map(y => {
@@ -2647,13 +2897,18 @@
                                    {/* 2. ÉVOLUTION DES PRIX */}
                                    {yearAvg.length >= 1 && (
                                        <div className={`p-3 rounded-lg border mb-3 ${darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
-                                           <div className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${theme.textMuted}`}>Prix/m² par année</div>
+                                           <div className="mb-2">
+                                               <div className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Prix/m² par année</div>
+                                               <div className={`text-[8px] ${theme.textMuted}`}>Sur la section cadastrale et {dvfRadius}m alentours</div>
+                                           </div>
                                            <div className="space-y-1.5">
                                                {yearAvg.slice(-5).map(y => (
                                                    <div key={y.year} className={`flex justify-between items-center px-2 py-1.5 rounded-lg border ${darkMode ? 'bg-slate-700/30 border-slate-700' : 'bg-white border-slate-100'}`}>
                                                        <div className="flex items-center gap-2">
                                                            <span className={`text-[11px] font-bold ${theme.textTitle}`}>{y.year}</span>
-                                                           <span className={`text-[8px] px-1.5 py-0.5 rounded font-bold ${darkMode ? 'bg-slate-700 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>{y.types[0]}</span>
+                                                           <span className={`text-[8px] px-1.5 py-0.5 rounded font-bold ${darkMode ? 'bg-slate-700 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>
+                                                               {y.types[0]} ({y.count} {y.count > 1 ? 'ventes' : 'vente'})
+                                                           </span>
                                                        </div>
                                                        <span className={`text-[11px] font-bold ${darkMode ? 'text-emerald-400' : 'text-emerald-700'}`}>{y.avg.toLocaleString('fr-FR')} €/m²</span>
                                                    </div>
@@ -2699,69 +2954,6 @@
                                            <div id="simResult"></div>
                                        </div>
                                    </details>
-
-                                   {/* 4. LISTE DES VENTES DVF */}
-                                   <div className={`mb-3`}>
-                                       <div className="flex items-center justify-between mb-2">
-                                           <div className={`text-[10px] font-bold uppercase tracking-wider ${theme.textMuted}`}>Historique des ventes ({dvf.length})</div>
-                                       </div>
-                                       {dvfLinks.length > 0 && (
-                                           <button onClick={() => { setDvfLinks([]); setPolygons(prev => prev.filter(p => !p.isDvfHighlight)); }} className={`w-full mb-2 py-1.5 rounded-lg text-[9px] font-bold text-center transition-all ${darkMode ? 'bg-red-900/30 text-red-400 border border-red-800/50 hover:bg-red-900/50' : 'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100'}`}>
-                                               Effacer les localisations ({dvfLinks.length})
-                                           </button>
-                                       )}
-                                       {dvf.length > 0 ? (
-                                           <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1 custom-scrollbar">
-                                               {dvf.map((sale, idx) => {
-                                                   const saleDate = clean(sale.dateStr);
-                                                   const saleType = clean(sale.type_local);
-                                                   const saleSurfBati = clean(sale.surface_reelle_bati);
-                                                   const saleSurfTerrain = clean(sale.surface_terrain);
-                                                   const details = [sale.nature_mutation || 'Vente'];
-                                                   if (saleType) details.push(saleType);
-                                                   if (saleSurfBati && saleSurfBati !== '0' && saleSurfBati !== '0.0') details.push(`${parseFloat(saleSurfBati)} m² bâti`);
-                                                   if (saleSurfTerrain && saleSurfTerrain !== '0' && saleSurfTerrain !== '0.0') details.push(`${parseFloat(saleSurfTerrain)} m² terrain`);
-                                                   
-                                                   const surfM2 = parseFloat(saleSurfBati) || parseFloat(saleSurfTerrain) || 0;
-                                                   const salePrixM2 = (sale.valeur && surfM2 > 0) ? Math.round(sale.valeur / surfM2) : null;
-                                                   const canLocate = !sale.isExactParcel && sale.displayId && sale.displayId.length >= 10;
-                                                   
-                                                   return (
-                                                       <div key={idx} onClick={() => { if (canLocate) { locateDvfParcel(sale.displayId); if (window.innerWidth < 768) setPanelHeight(5); } }}
-                                                         className={`p-2.5 rounded-lg border transition-all ${canLocate ? 'cursor-pointer hover:ring-1 hover:ring-amber-400/50' : ''} ${
-                                                         sale.isExactParcel 
-                                                           ? (darkMode ? 'bg-indigo-950/60 border-indigo-500' : 'bg-indigo-50/80 border-indigo-400')
-                                                           : (darkMode ? 'bg-slate-800/50 border-slate-700/50' : 'bg-slate-50 border-slate-200/50')
-                                                       }`}>
-                                                           <div className="flex justify-between items-start mb-1">
-                                                               <div className="flex flex-col">
-                                                                   <div className="flex items-baseline gap-2">
-                                                                       <span className={`font-bold ${sale.isExactParcel ? 'text-base' : 'text-sm'} ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
-                                                                           {sale.valeur !== null ? new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(sale.valeur) : 'Prix NC'}
-                                                                       </span>
-                                                                       {salePrixM2 !== null && <span className={`text-[9px] font-bold ${darkMode ? 'text-emerald-400' : 'text-emerald-600'}`}>{salePrixM2 < 1 ? '<1' : salePrixM2.toLocaleString('fr-FR')} €/m²</span>}
-                                                                   </div>
-                                                                   {canLocate && <span className={`text-[8px] font-bold ${darkMode ? 'text-sky-400' : 'text-sky-600'}`}>{sale.distance > 0 ? `à ${sale.distance < 1000 ? sale.distance + 'm' : (sale.distance/1000).toFixed(1) + 'km'}` : 'Localiser'}</span>}
-                                                               </div>
-                                                               {saleDate && (
-                                                                 <span className={`text-[9px] font-medium px-1.5 py-0.5 rounded border ${darkMode ? 'bg-slate-800 text-slate-300 border-slate-600' : 'bg-white text-slate-700 border-slate-200'}`}>
-                                                                     {new Date(saleDate).toLocaleDateString('fr-FR')}
-                                                                 </span>
-                                                               )}
-                                                           </div>
-                                                           <div className={`text-[9px] ${theme.textMuted}`}>{details.join(' • ')}</div>
-                                                       </div>
-                                                   );
-                                               })}
-                                           </div>
-                                       ) : (
-                                           <div className={`text-[10px] p-3 text-center rounded-lg border ${darkMode ? 'bg-slate-800/50 border-slate-700/50 text-slate-400' : 'bg-slate-50 border-slate-200/50 text-slate-500'}`}>Aucune vente publique trouvée.</div>
-                                       )}
-                                   </div>
-                                   
-                                   <div className="pt-2 border-t flex flex-col gap-2" style={{borderColor: darkMode ? '#334155' : '#e2e8f0'}}>
-                                        <p className={`text-[9px] text-center ${theme.textMuted}`}>Données estimatives issues de DVF/DGFiP</p>
-                                   </div>
                                    </>
                                    );
                                })()}
@@ -2778,7 +2970,7 @@
                                    { id: 'plan', label: 'Plan IGN', icon: '🗺' },
                                    { id: 'cadastre', label: 'Cadastre', icon: '📐' },
                                ].map(m => (
-                                   <button key={m.id} onClick={() => { setBaseMap(m.id); setActivePanelTab('synthese'); }} className={`w-full flex items-center gap-3 p-3 rounded-lg border text-left transition-all ${baseMap === m.id ? (darkMode ? 'bg-emerald-900/30 border-emerald-700 text-emerald-400' : 'bg-emerald-50 border-emerald-300 text-emerald-700') : (darkMode ? 'bg-slate-800/50 border-slate-700 text-slate-300 hover:bg-slate-700/50' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50')}`}>
+                                   <button key={m.id} onClick={() => setBaseMap(m.id)} className={`w-full flex items-center gap-3 p-3 rounded-lg border text-left transition-all ${baseMap === m.id ? (darkMode ? 'bg-emerald-900/30 border-emerald-700 text-emerald-400' : 'bg-emerald-50 border-emerald-300 text-emerald-700') : (darkMode ? 'bg-slate-800/50 border-slate-700 text-slate-300 hover:bg-slate-700/50' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50')}`}>
                                        <span className="text-lg">{m.icon}</span>
                                        <span className="text-sm font-bold">{m.label}</span>
                                        {baseMap === m.id && <svg className="w-4 h-4 ml-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>}
